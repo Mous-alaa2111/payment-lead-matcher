@@ -235,6 +235,38 @@ async function main() {
     check("newest payment listed first", page.indexOf("2026-01-03") < page.indexOf("2026-01-01"));
     page = await (await viewer.fetch(`/dashboard/clients/${client.id}`)).text();
     check("viewer sees payments but no Sync now", page.includes("$123.45") && !page.includes("Sync now"));
+
+    // --- Payments pagination: 45 rows -> pages of 20, 20, 5; totals cover all rows ---
+    await db.insert(paymentMatches).values(
+      Array.from({ length: 42 }, (_, i) => ({
+        clientId: client.id, provider: "square" as const, externalPaymentId: `older-${i}`,
+        paidAt: new Date(Date.UTC(2025, 0, 1) - i * 86_400_000), amountCents: 100_000 + i * 100, currency: "USD",
+        status: "no_match" as const,
+      })),
+    );
+    const payPage = async (q = "") => {
+      const html = (await (await owner.fetch(`/dashboard/clients/${client.id}${q}`)).text()).replace(/<!-- -->/g, "");
+      return {
+        html,
+        rows: html.match(/<tr class="align-top"/g)?.length ?? 0,
+        // Only the visible table; the page's embedded RSC payload repeats the same text.
+        amounts: [...html.slice(html.indexOf("<tbody"), html.indexOf("</tbody>")).matchAll(/\$[\d,]+\.\d\d/g)].map((m) => m[0]),
+      };
+    };
+    const p1 = await payPage();
+    check("page 1 shows 20 rows", p1.rows === 20, `rows ${p1.rows}`);
+    check("summary counts cover all 45 rows", p1.html.includes("45 payments: 1 matched, 1 ambiguous, 43 with no matching lead"));
+    check("page 1: Previous disabled, Next links to page 2",
+      p1.html.includes("Page 1 of 3") && /<span aria-disabled[^>]*>← Previous/.test(p1.html) && /<a [^>]*href="[^"]*\?page=2"[^>]*>Next →/.test(p1.html));
+    const p2 = await payPage("?page=2");
+    const p3 = await payPage("?page=3");
+    check("page 3 shows the last 5 rows, Next disabled",
+      p3.rows === 5 && p3.html.includes("Page 3 of 3") && /<span aria-disabled[^>]*>Next →/.test(p3.html));
+    check("summary counts are the same on every page", p3.html.includes("45 payments: 1 matched, 1 ambiguous, 43 with no matching lead"));
+    const all = [...p1.amounts, ...p2.amounts, ...p3.amounts];
+    check("pages don't overlap or skip rows", all.length === 45 && new Set(all).size === 45, `${all.length} amounts, ${new Set(all).size} unique`);
+    check("out-of-range page clamps to the last page", (await payPage("?page=99")).html.includes("Page 3 of 3"));
+    check("junk page param falls back to page 1", (await payPage("?page=abc")).html.includes("Page 1 of 3"));
   } finally {
     await db.delete(user).where(like(user.email, `${tag}-%`));
     await db.delete(invitations).where(like(invitations.email, `${tag}-%`));

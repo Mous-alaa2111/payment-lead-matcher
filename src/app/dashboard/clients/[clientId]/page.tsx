@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNull } from "drizzle-orm";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { db } from "@/db";
@@ -7,7 +7,6 @@ import { canManage, getMembership, isUuid, requireSession } from "@/lib/access";
 import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
-import { RECENT_PAYMENTS } from "@/lib/sync";
 import { disconnectAction, revokeInviteAction, syncAction } from "./actions";
 import { InviteForm } from "./invite-form";
 
@@ -29,6 +28,8 @@ const STATUS_LABEL = {
   no_match: { text: "No match", cls: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300" },
 } as const;
 
+const PAGE_SIZE = 20;
+
 const money = (cents: number, currency: string) =>
   new Intl.NumberFormat("en-US", { style: "currency", currency: currency || "USD" }).format(cents / 100);
 
@@ -47,7 +48,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
   const { client, role } = membership;
   const manage = canManage(role);
 
-  const [connections, members, pendingInvites, matches] = await Promise.all([
+  const [connections, members, pendingInvites, statusCounts] = await Promise.all([
     db.select().from(paymentConnections).where(eq(paymentConnections.clientId, clientId)),
     db
       .select({ name: user.name, email: user.email, role: clientMembers.role })
@@ -68,15 +69,29 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           .orderBy(desc(invitations.createdAt))
       : Promise.resolve([]),
     db
-      .select()
+      .select({ status: paymentMatches.status, n: count() })
       .from(paymentMatches)
       .where(eq(paymentMatches.clientId, clientId))
-      .orderBy(desc(paymentMatches.paidAt))
-      .limit(RECENT_PAYMENTS),
+      .groupBy(paymentMatches.status),
   ]);
   const square = connections.find((c) => c.provider === "square");
+
+  // Summary counts cover every stored payment; the table shows one page of them.
   const counts = { matched: 0, ambiguous: 0, no_match: 0 };
-  for (const m of matches) counts[m.status]++;
+  for (const c of statusCounts) counts[c.status] = c.n;
+  const total = counts.matched + counts.ambiguous + counts.no_match;
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const page = Math.min(Math.max(1, Math.floor(Number(search.page)) || 1), pageCount);
+  const matches = total
+    ? await db
+        .select()
+        .from(paymentMatches)
+        .where(eq(paymentMatches.clientId, clientId))
+        .orderBy(desc(paymentMatches.paidAt), desc(paymentMatches.id))
+        .limit(PAGE_SIZE)
+        .offset((page - 1) * PAGE_SIZE)
+    : [];
+  const pageHref = (n: number) => `/dashboard/clients/${clientId}?page=${n}`;
 
   const flash = Object.entries(search)
     .map(([k, v]) => MESSAGES[`${k}=${v}`] ?? (k === "error" ? `Something went wrong (${v}).` : null))
@@ -163,7 +178,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         ) : (
           <>
             <p className="text-sm text-zinc-500">
-              Most recent {matches.length} payments: {counts.matched} matched, {counts.ambiguous} ambiguous,{" "}
+              {total} payments: {counts.matched} matched, {counts.ambiguous} ambiguous,{" "}
               {counts.no_match} with no matching lead.
             </p>
             <div className="overflow-x-auto rounded-lg border">
@@ -211,6 +226,31 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                 </tbody>
               </table>
             </div>
+            {pageCount > 1 && (
+              <nav aria-label="Payments pages" className="flex items-center justify-between gap-4 text-sm">
+                {page > 1 ? (
+                  <Link href={pageHref(page - 1)} scroll={false} className="rounded-md border px-3 py-1.5">
+                    ← Previous
+                  </Link>
+                ) : (
+                  <span aria-disabled className="rounded-md border px-3 py-1.5 opacity-40">
+                    ← Previous
+                  </span>
+                )}
+                <span className="text-zinc-500">
+                  Page {page} of {pageCount} · {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, total)} of {total}
+                </span>
+                {page < pageCount ? (
+                  <Link href={pageHref(page + 1)} scroll={false} className="rounded-md border px-3 py-1.5">
+                    Next →
+                  </Link>
+                ) : (
+                  <span aria-disabled className="rounded-md border px-3 py-1.5 opacity-40">
+                    Next →
+                  </span>
+                )}
+              </nav>
+            )}
           </>
         )}
       </section>
