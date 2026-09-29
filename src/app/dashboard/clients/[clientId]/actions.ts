@@ -10,6 +10,7 @@ import { revokeSquare } from "@/lib/connect/square";
 import { deauthorizeStripe } from "@/lib/connect/stripe";
 import { canManageInviteRole, createInvitation, revokeInvitation } from "@/lib/invitations";
 import { syncSquare } from "@/lib/sync";
+import { formatDay, parseRange, type SyncWindow } from "@/lib/sync/window";
 
 const ROLES: ClientRole[] = ["owner", "admin", "viewer"];
 
@@ -70,18 +71,35 @@ export async function disconnectAction(form: FormData) {
   revalidatePath(`/dashboard/clients/${clientId}`);
 }
 
+// Plain "Sync now" posts no dates and syncs everything since the last sync;
+// the date-range form posts from/to (YYYY-MM-DD) for a backfill or one period.
 export async function syncAction(form: FormData) {
   const clientId = String(form.get("clientId"));
   await requireManager(clientId);
+  const page = `/dashboard/clients/${clientId}`;
+
+  const from = String(form.get("from") ?? "");
+  const to = String(form.get("to") ?? "");
+  let range: SyncWindow | undefined;
+  if (from || to) {
+    const parsed = parseRange(from, to);
+    if ("error" in parsed) redirect(`${page}?error=bad_range`);
+    range = parsed;
+  }
 
   // The error itself is stored on the connection and shown on the page.
-  let ok = true;
+  let result: string;
   try {
-    await syncSquare(clientId);
+    const s = await syncSquare(clientId, range);
+    result = new URLSearchParams({
+      synced: String(s.payments),
+      from: formatDay(s.window.start),
+      to: formatDay(new Date(s.window.end.getTime() - 1)), // end is exclusive
+    }).toString();
   } catch (err) {
     console.error("[sync:square]", err);
-    ok = false;
+    result = "error=sync_failed";
   }
-  revalidatePath(`/dashboard/clients/${clientId}`);
-  redirect(`/dashboard/clients/${clientId}?${ok ? "synced=1" : "error=sync_failed"}`);
+  revalidatePath(page);
+  redirect(`${page}?${result}`);
 }

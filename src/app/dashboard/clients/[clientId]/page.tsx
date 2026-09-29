@@ -7,8 +7,12 @@ import { canManage, getMembership, isUuid, requireSession } from "@/lib/access";
 import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
+import { formatDay } from "@/lib/sync/window";
 import { disconnectAction, revokeInviteAction, syncAction } from "./actions";
 import { InviteForm } from "./invite-form";
+
+// Server Actions on this page (Sync now, date-range backfills) may run long.
+export const maxDuration = 300;
 
 const MESSAGES: Record<string, string> = {
   "connected=stripe": "Stripe account connected.",
@@ -18,7 +22,7 @@ const MESSAGES: Record<string, string> = {
   "error=square_not_configured": "Square OAuth isn't configured on the server yet.",
   "error=stripe_exchange_failed": "Stripe didn't accept the connection. Please try again.",
   "error=square_exchange_failed": "Square didn't accept the connection. Please try again.",
-  "synced=1": "Sync finished.",
+  "error=bad_range": "Pick a start and end date, with the start on or before the end.",
   "error=sync_failed": "Sync failed. The error is shown under Payments.",
 };
 
@@ -75,6 +79,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
       .groupBy(paymentMatches.status),
   ]);
   const square = connections.find((c) => c.provider === "square");
+  const today = formatDay(new Date());
 
   // Summary counts cover every stored payment; the table shows one page of them.
   const counts = { matched: 0, ambiguous: 0, no_match: 0 };
@@ -93,7 +98,9 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
     : [];
   const pageHref = (n: number) => `/dashboard/clients/${clientId}?page=${n}`;
 
-  const flash = Object.entries(search)
+  const flash = search.synced
+    ? `Sync finished: ${search.synced} payment${search.synced === "1" ? "" : "s"} fetched for ${search.from} to ${search.to} (UTC).`
+    : Object.entries(search)
     .map(([k, v]) => MESSAGES[`${k}=${v}`] ?? (k === "error" ? `Something went wrong (${v}).` : null))
     .find(Boolean);
 
@@ -156,6 +163,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             {square && (
               <p className="text-sm text-zinc-500">
                 {square.lastSyncedAt ? `Last synced ${square.lastSyncedAt.toISOString().slice(0, 16).replace("T", " ")} UTC` : "Never synced"}
+                {square.syncedThrough && ` · payments synced through ${formatDay(square.syncedThrough)}`}
               </p>
             )}
           </div>
@@ -166,6 +174,40 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             </form>
           )}
         </div>
+        {manage && square && (
+          <details className="rounded-lg border px-4 py-3 text-sm">
+            <summary className="cursor-pointer text-zinc-500">Sync a date range</summary>
+            <form action={syncAction} className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
+              <input type="hidden" name="clientId" value={clientId} />
+              <label className="flex flex-col gap-1">
+                <span className="text-zinc-500">From</span>
+                <input
+                  type="date"
+                  name="from"
+                  required
+                  max={today}
+                  className="rounded-md border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-zinc-500">To</span>
+                <input
+                  type="date"
+                  name="to"
+                  required
+                  defaultValue={today}
+                  max={today}
+                  className="rounded-md border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
+                />
+              </label>
+              <button className="rounded-md border px-3 py-2">Sync range</button>
+            </form>
+            <p className="mt-2 text-xs text-zinc-500">
+              Dates are UTC and include both days. Use it to backfill a client&apos;s full history or re-sync one
+              period; plain Sync now keeps pulling everything since the last sync.
+            </p>
+          </details>
+        )}
         {square?.lastSyncError && (
           <p className="rounded-md border border-red-300 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:text-red-400">
             Last sync failed: {square.lastSyncError}

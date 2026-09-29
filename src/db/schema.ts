@@ -98,6 +98,8 @@ export const paymentConnections = pgTable(
     connectedBy: text("connected_by").references(() => user.id, { onDelete: "set null" }),
     lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
     lastSyncError: text("last_sync_error"),
+    // Payments are synced up to here; the next plain "Sync now" continues from it (lib/sync/window).
+    syncedThrough: timestamp("synced_through", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .defaultNow()

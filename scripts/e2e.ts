@@ -59,6 +59,133 @@ class Jar {
   }
 }
 
+// Runs syncSquare in this process with fetch faked for Square and GHL only
+// (Neon and the local app still get real requests). Square pages are 2 long so
+// cursor paging is exercised.
+async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("../src/db");
+  const { clients, clientMembers, paymentConnections, paymentMatches } = await import("../src/db/schema");
+  const { encrypt } = await import("../src/lib/crypto");
+  const { syncSquare } = await import("../src/lib/sync");
+  const { parseRange, formatDay } = await import("../src/lib/sync/window");
+
+  const DAY = 86_400_000;
+  const ago = (d: number) => new Date(Date.now() - d * DAY).toISOString();
+  const payments = [
+    { id: "p1", created_at: ago(1), customer_id: "cust-a", amount_money: { amount: 1000, currency: "USD" } },
+    { id: "p2", created_at: ago(10), customer_id: "cust-b", amount_money: { amount: 2000, currency: "USD" } },
+    { id: "p3", created_at: ago(200), amount_money: { amount: 3000, currency: "USD" }, buyer_email_address: "x@example.com" },
+    { id: "p4", created_at: ago(400), amount_money: { amount: 4000, currency: "USD" } },
+    { id: "p5", created_at: ago(401), amount_money: { amount: 5000, currency: "USD" } },
+  ];
+  const customers: Record<string, object> = {
+    "cust-a": { given_name: "Ann", phone_number: "+15550000001" },
+    "cust-b": { given_name: "Bob", email_address: "bob@example.com" },
+  };
+  const ghl: object[] = [{ id: "g-ann", firstName: "Ann", phone: "(555) 000-0001" }];
+  const paymentCalls: URL[] = [];
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const json = (b: object) => new Response(JSON.stringify(b), { status: 200 });
+    if (url.hostname === "connect.squareupsandbox.com") {
+      if (url.pathname === "/v2/locations") return json({ locations: [{ id: "L1", status: "ACTIVE" }] });
+      if (url.pathname === "/v2/customers/bulk-retrieve") {
+        const ids: string[] = JSON.parse(String(init?.body)).customer_ids;
+        return json({ responses: Object.fromEntries(ids.map((id) => [id, { customer: customers[id] }])) });
+      }
+      paymentCalls.push(url);
+      const begin = url.searchParams.get("begin_time")!;
+      const end = url.searchParams.get("end_time")!;
+      const inWindow = payments
+        .filter((p) => p.created_at >= begin && p.created_at < end)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at));
+      const from = Number(url.searchParams.get("cursor") ?? 0);
+      return json({ payments: inWindow.slice(from, from + 2), ...(from + 2 < inWindow.length ? { cursor: String(from + 2) } : {}) });
+    }
+    if (url.hostname === "services.leadconnectorhq.com") return json({ contacts: ghl, meta: {} });
+    return realFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    const [c] = await db
+      .insert(clients)
+      .values({ name: `E2E sync ${tag}`, slug: `${tag}-sync`, ghlLocationId: `${tag}-loc`, ghlTokenEnc: encrypt("fake-pit") })
+      .returning();
+    await db.insert(paymentConnections).values({
+      clientId: c.id, provider: "square", externalAccountId: `${tag}-m2`, accessTokenEnc: encrypt("fake"), livemode: false,
+    });
+    const conn = async () => (await db.select().from(paymentConnections).where(eq(paymentConnections.clientId, c.id)))[0];
+    const rows = async () => db.select().from(paymentMatches).where(eq(paymentMatches.clientId, c.id));
+    const byId = async () => Object.fromEntries((await rows()).map((r) => [r.externalPaymentId, r]));
+
+    // Backfill an old period first: pages through, doesn't touch synced_through.
+    const range = parseRange(formatDay(new Date(Date.now() - 450 * DAY)), formatDay(new Date(Date.now() - 150 * DAY)));
+    if ("error" in range) throw new Error(range.error);
+    let s = await syncSquare(c.id, range);
+    check("range sync fetches only payments in the range, across pages", s.payments === 3 && (await rows()).length === 3, `${s.payments} fetched`);
+    check(
+      "range sync passed begin/end to Square and followed the cursor",
+      paymentCalls.length === 2 && paymentCalls.every((u) => u.searchParams.get("begin_time") === range.start.toISOString()),
+    );
+    check("range sync on a never-synced connection leaves synced_through unset", (await conn()).syncedThrough === null);
+
+    // First plain sync: last 90 days.
+    s = await syncSquare(c.id);
+    let r = await byId();
+    check("first plain sync pulls the last 90 days", s.window.kind === "latest" && s.payments === 2 && Object.keys(r).length === 5);
+    check("phone match on the new payment, no match for the unknown payer", r.p1.status === "matched" && r.p1.method === "phone" && r.p2.status === "no_match");
+    const through = (await conn()).syncedThrough;
+    check("plain sync sets synced_through", Boolean(through) && Math.abs(through!.getTime() - Date.now()) < 60_000);
+
+    // Bob becomes a lead in GHL. The next plain sync only refetches the last
+    // ~7 days (p1), but p2 (10 days old) must still be re-matched.
+    ghl.push({ id: "g-bob", firstName: "Bob", email: "BOB@example.com" });
+    paymentCalls.length = 0;
+    s = await syncSquare(c.id);
+    r = await byId();
+    check(
+      "next plain sync starts 7 days before synced_through",
+      s.payments === 1 && paymentCalls[0]?.searchParams.get("begin_time") === new Date(through!.getTime() - 7 * DAY).toISOString(),
+    );
+    check(
+      "older payment re-matched after its lead appeared in GHL",
+      s.rematched === 1 && r.p2.status === "matched" && r.p2.method === "email" && r.p2.contacts[0]?.id === "g-bob",
+    );
+    check("no duplicate rows after repeated syncs", (await rows()).length === 5);
+
+    // Page: range form for managers only; a bad range is rejected before any sync.
+    const members = await db.select().from(clientMembers).where(eq(clientMembers.clientId, clientId));
+    const idOf = (role: string) => members.find((m) => m.role === role)!.userId;
+    await db.insert(clientMembers).values([
+      { clientId: c.id, userId: idOf("owner"), role: "owner" },
+      { clientId: c.id, userId: idOf("viewer"), role: "viewer" },
+    ]);
+    const ownerPage = (await (await owner.fetch(`/dashboard/clients/${c.id}`)).text()).replace(/<!-- -->/g, "");
+    check(
+      "owner sees the date-range form and synced-through date",
+      ownerPage.includes("Sync a date range") && ownerPage.includes('name="from"') && ownerPage.includes(`payments synced through ${formatDay(through!)}`),
+    );
+    const viewerPage = await (await viewer.fetch(`/dashboard/clients/${c.id}`)).text();
+    check("viewer doesn't see the date-range form", !viewerPage.includes("Sync a date range"));
+    const form = ownerPage.split("<form").find((f) => f.includes("Sync range"))!;
+    const fd = new FormData();
+    for (const m of form.matchAll(/<input[^>]*name="([^"]+)"(?:[^>]*value="([^"]*)")?/g)) fd.append(m[1], m[2] ?? "");
+    fd.set("from", "2026-02-01");
+    fd.set("to", "2026-01-01");
+    const before = (await conn()).lastSyncedAt?.getTime();
+    const res = await owner.fetch(`/dashboard/clients/${c.id}`, { method: "POST", body: fd });
+    const loc = res.headers.get("location") ?? "";
+    check("reversed date range is rejected with a message", loc.includes("error=bad_range"), `${res.status} ${loc}`);
+    const after = await conn();
+    check("rejected range didn't run a sync", after.lastSyncedAt?.getTime() === before && !after.lastSyncError);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 async function main() {
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
@@ -267,10 +394,13 @@ async function main() {
     check("pages don't overlap or skip rows", all.length === 45 && new Set(all).size === 45, `${all.length} amounts, ${new Set(all).size} unique`);
     check("out-of-range page clamps to the last page", (await payPage("?page=99")).html.includes("Page 3 of 3"));
     check("junk page param falls back to page 1", (await payPage("?page=abc")).html.includes("Page 1 of 3"));
+
+    // --- Sync windows, paging and re-matching (real sync code; Square + GHL faked in-process) ---
+    await syncWindowChecks(client.id, owner, viewer);
   } finally {
     await db.delete(user).where(like(user.email, `${tag}-%`));
     await db.delete(invitations).where(like(invitations.email, `${tag}-%`));
-    await db.delete(clients).where(inArray(clients.slug, [tag, `${tag}-other`]));
+    await db.delete(clients).where(inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`]));
   }
 
   // Encryption round trip
