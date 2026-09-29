@@ -1,10 +1,18 @@
 // End-to-end checks for invite-only sign-up, client permissions and the OAuth
-// start/callback flow. Needs the app running on :3000 with fake Stripe creds:
-//   $env:STRIPE_CONNECT_CLIENT_ID="ca_e2e_fake"; $env:STRIPE_SECRET_KEY="sk_test_e2e_fake"; npm run build; npm start
+// start/callback flow. Runs against the Neon e2e branch (.env.test.local), never
+// production. Start the app against the same branch, then run the suite:
+//   npm run e2e:server      (builds + starts :3000 with fake Stripe creds, no Square)
 //   npm run test:e2e
-// Leave Square unconfigured. All test rows are deleted at the end.
+// All test rows are deleted at the end.
 import { config } from "dotenv";
-config({ path: ".env.local", quiet: true });
+import { selectE2EDatabase } from "./e2e-db";
+try {
+  console.log(`Using e2e database (${selectE2EDatabase()})`);
+} catch (e) {
+  console.error((e as Error).message);
+  process.exit(1);
+}
+config({ path: ".env.local", quiet: true }); // other vars only; DATABASE_URL is already set
 
 const BASE = "http://localhost:3000";
 const tag = `e2e${Date.now()}`;
@@ -63,6 +71,16 @@ async function main() {
   const tokenOf = (url: string) => url.split("/invite/")[1];
 
   try {
+    // The server must read the same database we write fixtures to, or its writes land elsewhere.
+    const probe = await createInvitation({ email: `${tag}-probe@example.com`, clientId: client.id, role: "viewer", invitedBy: null });
+    const probePage = await fetch(`${BASE}/invite/${tokenOf(probe.url)}`).catch(() => null);
+    if (!probePage || !(await probePage.text()).includes("Create your account")) {
+      console.error("App on :3000 isn't running against the e2e database. Start it with `npm run e2e:server`.");
+      process.exitCode = 1;
+      return;
+    }
+    await db.delete(invitations).where(eq(invitations.id, probe.invite.id));
+
     // --- invite-only sign-up ---
     const anon = new Jar();
     let r = await anon.signUp(`${tag}-rando@example.com`);
