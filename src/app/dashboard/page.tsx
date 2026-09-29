@@ -1,14 +1,12 @@
 import { eq } from "drizzle-orm";
-import { headers } from "next/headers";
-import { redirect } from "next/navigation";
+import Link from "next/link";
 import { db } from "@/db";
 import { clientMembers, clients } from "@/db/schema";
-import { auth } from "@/lib/auth";
+import { requireSession } from "@/lib/access";
 import { SignOutButton } from "./sign-out-button";
 
 export default async function DashboardPage() {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) redirect("/sign-in");
+  const session = await requireSession();
 
   const myClients = await db
     .select({ id: clients.id, name: clients.name, role: clientMembers.role })
@@ -33,9 +31,14 @@ export default async function DashboardPage() {
         ) : (
           <ul className="divide-y rounded-lg border">
             {myClients.map((c) => (
-              <li key={c.id} className="flex justify-between px-4 py-3 text-sm">
-                <span>{c.name}</span>
-                <span className="text-zinc-500">{c.role}</span>
+              <li key={c.id}>
+                <Link
+                  href={`/dashboard/clients/${c.id}`}
+                  className="flex justify-between px-4 py-3 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900"
+                >
+                  <span>{c.name}</span>
+                  <span className="text-zinc-500">{c.role}</span>
+                </Link>
               </li>
             ))}
           </ul>

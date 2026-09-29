@@ -1,6 +1,8 @@
 import { relations } from "drizzle-orm";
 import {
+  boolean,
   index,
+  uniqueIndex,
   pgEnum,
   pgTable,
   primaryKey,
@@ -51,8 +53,59 @@ export const clientMembers = pgTable(
   ],
 );
 
+// Sign-up is invite-only. The raw token only ever exists in the invite link;
+// we store its SHA-256. clientId null = account only, no client membership.
+export const invitations = pgTable(
+  "invitations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    email: text("email").notNull(), // always stored lowercased
+    clientId: uuid("client_id").references(() => clients.id, { onDelete: "cascade" }),
+    role: clientRole("role").notNull().default("viewer"),
+    tokenHash: text("token_hash").notNull().unique(),
+    invitedBy: text("invited_by").references(() => user.id, { onDelete: "set null" }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+    acceptedBy: text("accepted_by").references(() => user.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index("invitations_email_idx").on(t.email)],
+);
+
+export const paymentProvider = pgEnum("payment_provider", ["stripe", "square"]);
+
+// One Stripe and/or one Square account per client, connected via OAuth.
+// Stripe: we only keep the account id and call the API with the platform key
+// plus the Stripe-Account header, so no tokens are stored.
+// Square: access/refresh tokens are stored AES-256-GCM encrypted (lib/crypto).
+export const paymentConnections = pgTable(
+  "payment_connections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    clientId: uuid("client_id")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    provider: paymentProvider("provider").notNull(),
+    externalAccountId: text("external_account_id").notNull(), // acct_... / merchant id
+    accessTokenEnc: text("access_token_enc"),
+    refreshTokenEnc: text("refresh_token_enc"),
+    tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }),
+    scope: text("scope"),
+    livemode: boolean("livemode").notNull(),
+    connectedBy: text("connected_by").references(() => user.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (t) => [uniqueIndex("payment_connections_client_provider_idx").on(t.clientId, t.provider)],
+);
+
 export const clientsRelations = relations(clients, ({ many }) => ({
   members: many(clientMembers),
+  invitations: many(invitations),
+  paymentConnections: many(paymentConnections),
 }));
 
 export const clientMembersRelations = relations(clientMembers, ({ one }) => ({
