@@ -62,8 +62,9 @@ class Jar {
 async function main() {
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
-  const { clients, clientMembers, invitations, user } = await import("../src/db/schema");
+  const { clients, clientMembers, invitations, paymentConnections, paymentMatches, user } = await import("../src/db/schema");
   const { createInvitation, findPendingInvitation, revokeInvitation } = await import("../src/lib/invitations");
+  const { encrypt, decrypt } = await import("../src/lib/crypto");
 
   const [client] = await db.insert(clients).values({ name: `E2E ${tag}`, slug: tag }).returning();
   const ownerEmail = `${tag}-owner@example.com`;
@@ -205,6 +206,35 @@ async function main() {
     check("fake code -> exchange fails cleanly (no crash)", (r.headers.get("location") ?? "").includes("error=stripe_exchange_failed"));
     r = await owner.fetch(`/api/connect/stripe/callback?code=ac_fake&state=${s3}`);
     check("state is single-use", (r.headers.get("location") ?? "").includes("error=invalid_state"));
+
+    // --- Payments table + sync (fake rows; never calls Square or GHL) ---
+    r = await owner.fetch(`/dashboard/clients/${client.id}`);
+    check("no connection -> payments placeholder", (await r.text()).includes("Connect a payment account to see payments here."));
+
+    const { syncSquare } = await import("../src/lib/sync");
+    await db.insert(paymentConnections).values({
+      clientId: client.id, provider: "square", externalAccountId: `${tag}-merchant`,
+      accessTokenEnc: encrypt("fake-square-token"), livemode: false,
+    });
+    const syncError = await syncSquare(client.id).then(() => null, (e: Error) => e.message);
+    check("sync without GHL creds fails before calling any API", Boolean(syncError?.includes("no GHL location")), syncError ?? "");
+    let page = await (await owner.fetch(`/dashboard/clients/${client.id}`)).text();
+    check("sync failure is shown on the page", page.includes("Last sync failed:") && page.includes("no GHL location"));
+
+    const contact = { id: "c1", name: "Pat Lead", email: null, phone: "+15550001111" };
+    await db.insert(paymentMatches).values([
+      { clientId: client.id, provider: "square", externalPaymentId: "p1", paidAt: new Date("2026-01-03"), amountCents: 12345, currency: "USD", payerName: "Pat Payer", payerPhone: "+15550001111", status: "matched", method: "phone", contacts: [contact] },
+      { clientId: client.id, provider: "square", externalPaymentId: "p2", paidAt: new Date("2026-01-02"), amountCents: 500, currency: "USD", status: "ambiguous", method: "email", contacts: [contact, { ...contact, id: "c2" }] },
+      { clientId: client.id, provider: "square", externalPaymentId: "p3", paidAt: new Date("2026-01-01"), amountCents: 700, currency: "USD", paymentStatus: "FAILED", status: "no_match" },
+    ]);
+    page = await (await owner.fetch(`/dashboard/clients/${client.id}`)).text();
+    check(
+      "owner sees payments table with counts and Sync now",
+      page.replace(/<!-- -->/g, "").includes("1 matched, 1 ambiguous,") && page.includes("$123.45") && page.includes("Pat Lead") && page.includes(">Sync now<"),
+    );
+    check("newest payment listed first", page.indexOf("2026-01-03") < page.indexOf("2026-01-01"));
+    page = await (await viewer.fetch(`/dashboard/clients/${client.id}`)).text();
+    check("viewer sees payments but no Sync now", page.includes("$123.45") && !page.includes("Sync now"));
   } finally {
     await db.delete(user).where(like(user.email, `${tag}-%`));
     await db.delete(invitations).where(like(invitations.email, `${tag}-%`));
@@ -212,7 +242,6 @@ async function main() {
   }
 
   // Encryption round trip
-  const { encrypt, decrypt } = await import("../src/lib/crypto");
   const ct = encrypt("EAAA-square-token");
   check("token encryption round-trips and isn't plaintext", decrypt(ct) === "EAAA-square-token" && !ct.includes("EAAA"));
 

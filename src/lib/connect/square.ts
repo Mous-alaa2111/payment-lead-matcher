@@ -4,7 +4,7 @@ import { appUrl } from "@/lib/url";
 // code-flow refresh tokens don't expire. Both are stored encrypted.
 // Docs: https://developer.squareup.com/docs/oauth-api/overview
 
-const SQUARE_VERSION = "2025-01-23";
+export const SQUARE_VERSION = "2025-01-23";
 
 // Read-only: everything payment-to-lead matching needs, nothing more.
 export const SQUARE_SCOPES = ["MERCHANT_PROFILE_READ", "PAYMENTS_READ", "CUSTOMERS_READ", "ORDERS_READ"];

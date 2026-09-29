@@ -2,6 +2,8 @@ import { relations } from "drizzle-orm";
 import {
   boolean,
   index,
+  integer,
+  jsonb,
   uniqueIndex,
   pgEnum,
   pgTable,
@@ -23,6 +25,7 @@ export const clients = pgTable("clients", {
   name: text("name").notNull(),
   slug: text("slug").notNull().unique(),
   ghlLocationId: text("ghl_location_id").unique(),
+  ghlTokenEnc: text("ghl_token_enc"), // location Private Integration Token, encrypted (lib/crypto)
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .defaultNow()
@@ -93,6 +96,8 @@ export const paymentConnections = pgTable(
     scope: text("scope"),
     livemode: boolean("livemode").notNull(),
     connectedBy: text("connected_by").references(() => user.id, { onDelete: "set null" }),
+    lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+    lastSyncError: text("last_sync_error"),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .defaultNow()
@@ -102,10 +107,46 @@ export const paymentConnections = pgTable(
   (t) => [uniqueIndex("payment_connections_client_provider_idx").on(t.clientId, t.provider)],
 );
 
+export const matchStatus = pgEnum("match_status", ["matched", "ambiguous", "no_match"]);
+export const matchMethod = pgEnum("match_method", ["email", "phone"]);
+
+export type MatchedContact = { id: string; name: string; email: string | null; phone: string | null };
+
+// One row per provider payment, with the result of matching its payer against
+// the client's GHL contacts. Re-syncing updates rows in place (upsert on the
+// provider's payment id) so a payment is re-matched as leads change.
+export const paymentMatches = pgTable(
+  "payment_matches",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    clientId: uuid("client_id")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    provider: paymentProvider("provider").notNull(),
+    externalPaymentId: text("external_payment_id").notNull(),
+    paidAt: timestamp("paid_at", { withTimezone: true }).notNull(),
+    amountCents: integer("amount_cents").notNull(),
+    currency: text("currency").notNull(),
+    paymentStatus: text("payment_status"), // provider's own status, e.g. COMPLETED / FAILED
+    payerName: text("payer_name"),
+    payerEmail: text("payer_email"),
+    payerPhone: text("payer_phone"),
+    status: matchStatus("status").notNull(),
+    method: matchMethod("method"),
+    contacts: jsonb("contacts").$type<MatchedContact[]>().notNull().default([]),
+    syncedAt: timestamp("synced_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex("payment_matches_payment_idx").on(t.clientId, t.provider, t.externalPaymentId),
+    index("payment_matches_client_paid_idx").on(t.clientId, t.paidAt),
+  ],
+);
+
 export const clientsRelations = relations(clients, ({ many }) => ({
   members: many(clientMembers),
   invitations: many(invitations),
   paymentConnections: many(paymentConnections),
+  paymentMatches: many(paymentMatches),
 }));
 
 export const clientMembersRelations = relations(clientMembers, ({ one }) => ({

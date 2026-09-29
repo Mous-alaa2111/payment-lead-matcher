@@ -37,6 +37,8 @@ if (process.argv[1]?.replace(/\\/g, "/").endsWith("scripts/e2e-db.ts")) {
     console.error((e as Error).message);
     process.exit(1);
   }
-  const r = spawnSync(cmd, args, { stdio: "inherit", shell: true, env: process.env });
+  // shell: true joins args with spaces, so re-quote any that contain spaces.
+  const quoted = args.map((a) => (/\s/.test(a) ? `"${a}"` : a));
+  const r = spawnSync(cmd, quoted, { stdio: "inherit", shell: true, env: process.env });
   process.exit(r.status ?? 1);
 }

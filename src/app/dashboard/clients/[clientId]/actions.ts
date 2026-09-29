@@ -2,12 +2,14 @@
 
 import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
 import { db } from "@/db";
 import { paymentConnections } from "@/db/schema";
 import { canManage, getMembership, isUuid, requireSession, type ClientRole } from "@/lib/access";
 import { revokeSquare } from "@/lib/connect/square";
 import { deauthorizeStripe } from "@/lib/connect/stripe";
 import { canManageInviteRole, createInvitation, revokeInvitation } from "@/lib/invitations";
+import { syncSquare } from "@/lib/sync";
 
 const ROLES: ClientRole[] = ["owner", "admin", "viewer"];
 
@@ -66,4 +68,20 @@ export async function disconnectAction(form: FormData) {
   }
   await db.delete(paymentConnections).where(where);
   revalidatePath(`/dashboard/clients/${clientId}`);
+}
+
+export async function syncAction(form: FormData) {
+  const clientId = String(form.get("clientId"));
+  await requireManager(clientId);
+
+  // The error itself is stored on the connection and shown on the page.
+  let ok = true;
+  try {
+    await syncSquare(clientId);
+  } catch (err) {
+    console.error("[sync:square]", err);
+    ok = false;
+  }
+  revalidatePath(`/dashboard/clients/${clientId}`);
+  redirect(`/dashboard/clients/${clientId}?${ok ? "synced=1" : "error=sync_failed"}`);
 }

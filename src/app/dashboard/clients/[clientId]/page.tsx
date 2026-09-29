@@ -2,12 +2,13 @@ import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { db } from "@/db";
-import { clientMembers, invitations, paymentConnections, user } from "@/db/schema";
+import { clientMembers, invitations, paymentConnections, paymentMatches, user } from "@/db/schema";
 import { canManage, getMembership, isUuid, requireSession } from "@/lib/access";
 import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
-import { disconnectAction, revokeInviteAction } from "./actions";
+import { RECENT_PAYMENTS } from "@/lib/sync";
+import { disconnectAction, revokeInviteAction, syncAction } from "./actions";
 import { InviteForm } from "./invite-form";
 
 const MESSAGES: Record<string, string> = {
@@ -18,7 +19,18 @@ const MESSAGES: Record<string, string> = {
   "error=square_not_configured": "Square OAuth isn't configured on the server yet.",
   "error=stripe_exchange_failed": "Stripe didn't accept the connection. Please try again.",
   "error=square_exchange_failed": "Square didn't accept the connection. Please try again.",
+  "synced=1": "Sync finished.",
+  "error=sync_failed": "Sync failed. The error is shown under Payments.",
 };
+
+const STATUS_LABEL = {
+  matched: { text: "Matched", cls: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300" },
+  ambiguous: { text: "Ambiguous", cls: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300" },
+  no_match: { text: "No match", cls: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300" },
+} as const;
+
+const money = (cents: number, currency: string) =>
+  new Intl.NumberFormat("en-US", { style: "currency", currency: currency || "USD" }).format(cents / 100);
 
 const PROVIDERS = [
   { id: "stripe", name: "Stripe", configured: stripeConfigured },
@@ -35,7 +47,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
   const { client, role } = membership;
   const manage = canManage(role);
 
-  const [connections, members, pendingInvites] = await Promise.all([
+  const [connections, members, pendingInvites, matches] = await Promise.all([
     db.select().from(paymentConnections).where(eq(paymentConnections.clientId, clientId)),
     db
       .select({ name: user.name, email: user.email, role: clientMembers.role })
@@ -55,14 +67,23 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           )
           .orderBy(desc(invitations.createdAt))
       : Promise.resolve([]),
+    db
+      .select()
+      .from(paymentMatches)
+      .where(eq(paymentMatches.clientId, clientId))
+      .orderBy(desc(paymentMatches.paidAt))
+      .limit(RECENT_PAYMENTS),
   ]);
+  const square = connections.find((c) => c.provider === "square");
+  const counts = { matched: 0, ambiguous: 0, no_match: 0 };
+  for (const m of matches) counts[m.status]++;
 
   const flash = Object.entries(search)
     .map(([k, v]) => MESSAGES[`${k}=${v}`] ?? (k === "error" ? `Something went wrong (${v}).` : null))
     .find(Boolean);
 
   return (
-    <main className="mx-auto max-w-3xl space-y-8 px-4 py-10">
+    <main className="mx-auto max-w-5xl space-y-8 px-4 py-10">
       <header>
         <Link href="/dashboard" className="text-sm text-zinc-500 hover:underline">
           ← All clients
@@ -111,6 +132,87 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             );
           })}
         </ul>
+      </section>
+
+      <section className="space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="font-medium">Payments</h2>
+            {square && (
+              <p className="text-sm text-zinc-500">
+                {square.lastSyncedAt ? `Last synced ${square.lastSyncedAt.toISOString().slice(0, 16).replace("T", " ")} UTC` : "Never synced"}
+              </p>
+            )}
+          </div>
+          {manage && square && (
+            <form action={syncAction}>
+              <input type="hidden" name="clientId" value={clientId} />
+              <button className="rounded-md border px-3 py-1.5 text-sm">Sync now</button>
+            </form>
+          )}
+        </div>
+        {square?.lastSyncError && (
+          <p className="rounded-md border border-red-300 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:text-red-400">
+            Last sync failed: {square.lastSyncError}
+          </p>
+        )}
+        {matches.length === 0 ? (
+          <p className="rounded-lg border px-4 py-3 text-sm text-zinc-500">
+            {square ? "No payments synced yet." : "Connect a payment account to see payments here."}
+          </p>
+        ) : (
+          <>
+            <p className="text-sm text-zinc-500">
+              Most recent {matches.length} payments: {counts.matched} matched, {counts.ambiguous} ambiguous,{" "}
+              {counts.no_match} with no matching lead.
+            </p>
+            <div className="overflow-x-auto rounded-lg border">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b text-zinc-500">
+                  <tr>
+                    <th className="px-4 py-2 font-medium">Date</th>
+                    <th className="px-4 py-2 text-right font-medium">Amount</th>
+                    <th className="px-4 py-2 font-medium">Payer</th>
+                    <th className="px-4 py-2 font-medium">Result</th>
+                    <th className="px-4 py-2 font-medium">GHL lead</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {matches.map((m) => (
+                    <tr key={m.id} className="align-top">
+                      <td className="whitespace-nowrap px-4 py-2">{m.paidAt.toISOString().slice(0, 10)}</td>
+                      <td className="whitespace-nowrap px-4 py-2 text-right tabular-nums">
+                        {money(m.amountCents, m.currency)}
+                        {m.paymentStatus && m.paymentStatus !== "COMPLETED" && (
+                          <span className="block text-xs text-zinc-500">{m.paymentStatus.toLowerCase()}</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2">
+                        <span className="block">{m.payerName ?? "—"}</span>
+                        <span className="block text-xs text-zinc-500">
+                          {[m.payerPhone, m.payerEmail].filter(Boolean).join(" · ") || "no contact details"}
+                        </span>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-2">
+                        <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATUS_LABEL[m.status].cls}`}>
+                          {STATUS_LABEL[m.status].text}
+                        </span>
+                        {m.method && <span className="block pt-1 text-xs text-zinc-500">by {m.method}</span>}
+                      </td>
+                      <td className="px-4 py-2">
+                        {m.contacts.map((c) => (
+                          <span key={c.id} className="block">
+                            {c.name} <span className="text-xs text-zinc-500">{c.id}</span>
+                          </span>
+                        ))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
       </section>
 
       <section className="space-y-3">
