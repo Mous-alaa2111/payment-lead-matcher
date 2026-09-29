@@ -6,7 +6,8 @@ import { clientMembers, invitations, paymentConnections, user } from "@/db/schem
 import { canManage, getMembership, isUuid, requireSession } from "@/lib/access";
 import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
-import { disconnectAction } from "./actions";
+import { canManageInviteRole } from "@/lib/invitations";
+import { disconnectAction, revokeInviteAction } from "./actions";
 import { InviteForm } from "./invite-form";
 
 const MESSAGES: Record<string, string> = {
@@ -43,7 +44,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
       .where(eq(clientMembers.clientId, clientId)),
     manage
       ? db
-          .select({ email: invitations.email, role: invitations.role, expiresAt: invitations.expiresAt })
+          .select({ id: invitations.id, email: invitations.email, role: invitations.role })
           .from(invitations)
           .where(
             and(
@@ -124,9 +125,20 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             </li>
           ))}
           {pendingInvites.map((i) => (
-            <li key={`invite-${i.email}-${i.expiresAt.toISOString()}`} className="flex justify-between px-4 py-3 text-sm text-zinc-500">
+            <li key={i.id} className="flex items-center justify-between gap-4 px-4 py-3 text-sm text-zinc-500">
               <span>{i.email} · invited</span>
-              <span>{i.role}</span>
+              <span className="flex items-center gap-3">
+                {i.role}
+                {canManageInviteRole(role, i.role) && (
+                  <form action={revokeInviteAction}>
+                    <input type="hidden" name="clientId" value={clientId} />
+                    <input type="hidden" name="inviteId" value={i.id} />
+                    <button className="rounded-md border px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800">
+                      Revoke
+                    </button>
+                  </form>
+                )}
+              </span>
             </li>
           ))}
         </ul>

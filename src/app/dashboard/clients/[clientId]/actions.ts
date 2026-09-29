@@ -7,7 +7,7 @@ import { paymentConnections } from "@/db/schema";
 import { canManage, getMembership, isUuid, requireSession, type ClientRole } from "@/lib/access";
 import { revokeSquare } from "@/lib/connect/square";
 import { deauthorizeStripe } from "@/lib/connect/stripe";
-import { createInvitation } from "@/lib/invitations";
+import { canManageInviteRole, createInvitation, revokeInvitation } from "@/lib/invitations";
 
 const ROLES: ClientRole[] = ["owner", "admin", "viewer"];
 
@@ -29,12 +29,22 @@ export async function inviteAction(_prev: InviteState, form: FormData): Promise<
   const role = String(form.get("role")) as ClientRole;
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "Enter a valid email address." };
   if (!ROLES.includes(role)) return { error: "Pick a role." };
-  // Admins can't mint owners.
-  if (role === "owner" && membership.role !== "owner") return { error: "Only owners can invite owners." };
+  if (!canManageInviteRole(membership.role, role)) return { error: "Only owners can invite owners." };
 
   const { url } = await createInvitation({ email, clientId, role, invitedBy: session.user.id });
   revalidatePath(`/dashboard/clients/${clientId}`);
   return { url, email };
+}
+
+export async function revokeInviteAction(form: FormData) {
+  const clientId = String(form.get("clientId"));
+  const inviteId = String(form.get("inviteId"));
+  const { membership } = await requireManager(clientId);
+  if (!isUuid(inviteId)) throw new Error("Bad invite id");
+
+  const result = await revokeInvitation({ inviteId, clientId, actorRole: membership.role });
+  if (result === "forbidden") throw new Error("Only owners can revoke owner invites");
+  revalidatePath(`/dashboard/clients/${clientId}`);
 }
 
 export async function disconnectAction(form: FormData) {

@@ -55,7 +55,7 @@ async function main() {
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
   const { clients, clientMembers, invitations, user } = await import("../src/db/schema");
-  const { createInvitation } = await import("../src/lib/invitations");
+  const { createInvitation, findPendingInvitation, revokeInvitation } = await import("../src/lib/invitations");
 
   const [client] = await db.insert(clients).values({ name: `E2E ${tag}`, slug: tag }).returning();
   const ownerEmail = `${tag}-owner@example.com`;
@@ -106,6 +106,42 @@ async function main() {
     check("viewer sees client page without Connect buttons", r.status === 200 && !vhtml.includes("/api/connect/") && vhtml.includes("Not connected"));
     r = await viewer.post("/api/connect/stripe/start", { clientId: client.id });
     check("viewer cannot start OAuth", r.status === 403, `status ${r.status}`);
+
+    // --- revoking pending invites ---
+    const adminEmail = `${tag}-admin@example.com`;
+    const adminInvite = await createInvitation({ email: adminEmail, clientId: client.id, role: "admin", invitedBy: ownerRow.id });
+    const admin = new Jar();
+    await admin.signUp(adminEmail, tokenOf(adminInvite.url));
+    const pendingOwner = await createInvitation({ email: `${tag}-pending-owner@example.com`, clientId: client.id, role: "owner", invitedBy: ownerRow.id });
+    const pendingViewer = await createInvitation({ email: `${tag}-pending-viewer@example.com`, clientId: client.id, role: "viewer", invitedBy: ownerRow.id });
+    const revokeButtons = async (jar: Jar) => {
+      const page = await (await jar.fetch(`/dashboard/clients/${client.id}`)).text();
+      return {
+        count: page.match(/>Revoke</g)?.length ?? 0,
+        listsPending: page.includes(`${tag}-pending-owner@example.com`) && page.includes(`${tag}-pending-viewer@example.com`),
+      };
+    };
+    let b = await revokeButtons(owner);
+    check("owner sees Revoke on both pending invites", b.listsPending && b.count === 2, `count ${b.count}`);
+    b = await revokeButtons(admin);
+    check("admin sees Revoke only on the non-owner invite", b.listsPending && b.count === 1, `count ${b.count}`);
+    b = await revokeButtons(viewer);
+    check("viewer sees no pending invites and no Revoke", !b.listsPending && b.count === 0, `count ${b.count}`);
+
+    const revoke = (inviteId: string, actorRole: "owner" | "admin" | "viewer", clientId = client.id) =>
+      revokeInvitation({ inviteId, clientId, actorRole });
+    check("viewer cannot revoke", (await revoke(pendingViewer.invite.id, "viewer")) === "forbidden");
+    check("admin cannot revoke an owner invite", (await revoke(pendingOwner.invite.id, "admin")) === "forbidden");
+    check("owner invite still valid after refused revoke", Boolean(await findPendingInvitation(tokenOf(pendingOwner.url))));
+    check("admin can revoke a viewer invite", (await revoke(pendingViewer.invite.id, "admin")) === "revoked");
+    check("revoked invite link no longer works", (await findPendingInvitation(tokenOf(pendingViewer.url))) === null);
+    r = await new Jar().signUp(`${tag}-pending-viewer@example.com`, tokenOf(pendingViewer.url));
+    check("revoked invite can't be used to sign up", r.status === 403, `status ${r.status}`);
+    check("revoke with the wrong client id is not_found", (await revoke(pendingOwner.invite.id, "owner", crypto.randomUUID())) === "not_found");
+    check("accepted invites can't be revoked", (await revoke(adminInvite.invite.id, "owner")) === "not_found");
+    check("owner can revoke an owner invite", (await revoke(pendingOwner.invite.id, "owner")) === "revoked");
+    b = await revokeButtons(owner);
+    check("revoked invites disappear from the Team list", b.count === 0 && !b.listsPending);
 
     r = await anon.post("/api/connect/stripe/start", { clientId: client.id });
     check("signed-out user cannot start OAuth", r.status === 303 && r.headers.get("location")!.endsWith("/sign-in"));

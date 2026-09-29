@@ -79,6 +79,33 @@ export async function acceptPendingInvitationsForEmail(email: string, userId: st
   for (const invite of rows) await accept(invite, userId);
 }
 
+// Same rule as creating invites: owners and admins can manage invites, but
+// only owners can create or revoke an owner invite.
+export function canManageInviteRole(actorRole: ClientRole, inviteRole: ClientRole) {
+  if (actorRole === "owner") return true;
+  if (actorRole === "admin") return inviteRole !== "owner";
+  return false;
+}
+
+// Deletes a pending invite for this client, so its link stops working.
+// Accepted invites are left alone (remove the member instead).
+export async function revokeInvitation(opts: { inviteId: string; clientId: string; actorRole: ClientRole }) {
+  const [invite] = await db
+    .select({ role: invitations.role })
+    .from(invitations)
+    .where(
+      and(eq(invitations.id, opts.inviteId), eq(invitations.clientId, opts.clientId), isNull(invitations.acceptedAt)),
+    );
+  if (!invite) return "not_found" as const;
+  if (!canManageInviteRole(opts.actorRole, invite.role)) return "forbidden" as const;
+  await db
+    .delete(invitations)
+    .where(
+      and(eq(invitations.id, opts.inviteId), eq(invitations.clientId, opts.clientId), isNull(invitations.acceptedAt)),
+    );
+  return "revoked" as const;
+}
+
 // Existing, signed-in user accepting one specific invite link.
 export async function acceptInvitation(token: string, user: { id: string; email: string }) {
   const invite = await findPendingInvitation(token);
