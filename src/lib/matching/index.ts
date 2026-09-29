@@ -42,13 +42,21 @@ export function normalizeEmail(email: string | null | undefined): string | null 
   return email.trim().toLowerCase() || null;
 }
 
-// Strip everything but digits and '+'. Bare 10-digit numbers are assumed US
-// (+1); 11 digits starting with 1 get a '+'; anything else just gets a '+'.
-// Mostly a defensive pass: Stripe and GHL already store E.164.
+// A trailing extension: "ext 12", "ext. 12", "extension 12", "x12", "#12",
+// or a dial pause ",12" / ";12".
+const PHONE_EXTENSION = /\s*(?:ext\.?|extension|x|#|,|;)\s*\d+\s*$/i;
+
+// Drop any extension, then strip everything but digits and '+'. Bare 10-digit
+// numbers are assumed US (+1); 11 digits starting with 1 get a '+'; anything
+// else just gets a '+'. Values with no digits at all ("+", "-", "n/a") count
+// as no phone. Mostly a defensive pass: Stripe and GHL already store E.164.
+// Deliberate differences from the Python original: extensions are removed
+// instead of being appended to the number, and digit-less values return null
+// instead of "+".
 export function normalizePhone(phone: string | null | undefined): string | null {
   if (!phone) return null;
-  let digits = phone.replace(/[^\d+]/g, "");
-  if (!digits) return null;
+  let digits = phone.replace(PHONE_EXTENSION, "").replace(/[^\d+]/g, "");
+  if (!/\d/.test(digits)) return null;
   if (!digits.startsWith("+")) {
     if (digits.length === 10) digits = "+1" + digits;
     else digits = "+" + digits; // covers the 11-digit "1..." case too

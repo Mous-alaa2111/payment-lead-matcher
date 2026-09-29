@@ -45,6 +45,24 @@ describe("normalizePhone", () => {
     ["+1 417 631 6585", "+14176316585"],
     ["447911123456", "+447911123456"],
     ["12345", "+12345"],
+    // extensions are dropped, not appended
+    ["+1-417-631-6585 ext 12", "+14176316585"],
+    ["  +1-417-631-6585 ext 12", "+14176316585"],
+    ["(417) 631-6585 ext. 204", "+14176316585"],
+    ["417-631-6585 extension 9", "+14176316585"],
+    ["417-631-6585 x12", "+14176316585"],
+    ["417-631-6585x12", "+14176316585"],
+    ["+14176316585 X 7", "+14176316585"],
+    ["+14176316585 #12", "+14176316585"],
+    ["+14176316585,12", "+14176316585"],
+    ["+14176316585;12", "+14176316585"],
+    ["4176316585x", "+14176316585"], // marker with no digits: nothing to strip
+    // digit-less values are "no phone"
+    ["+", null],
+    ["++", null],
+    [" + ", null],
+    ["-", null],
+    ["n/a", null],
     ["abc", null],
     ["", null],
     [null, null],
@@ -63,6 +81,27 @@ describe("buildContactIndexes", () => {
   });
   it("skips contacts with no email/phone for that index", () => {
     assert.equal([...idx.byPhone.values()].flat().some((c) => c.id.startsWith("synthetic")), false);
+  });
+});
+
+describe("junk phone values", () => {
+  const junk = buildContactIndexes([
+    { id: "junk_1", email: null, phone: "+" },
+    { id: "junk_2", email: null, phone: "+" },
+    { id: "real", email: null, phone: "+14176316585" },
+  ]);
+  it("contacts with phone '+' are not indexed", () => {
+    assert.deepEqual([...junk.byPhone.keys()], ["+14176316585"]);
+  });
+  it("a payment with phone '+' is no_match, not ambiguous", () => {
+    assert.deepEqual(matchPayment("square", { name: null, email: null, phone: "+" }, junk), {
+      status: "no_match",
+      method: null,
+    });
+  });
+  it("a payment with an extension still matches the contact", () => {
+    const r = matchPayment("square", { name: null, email: null, phone: "+1-417-631-6585 ext 12" }, junk);
+    assert.equal(r.status === "matched" && r.contact.id, "real");
   });
 });
 
