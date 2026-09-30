@@ -156,7 +156,7 @@ async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
     );
     check("no duplicate rows after repeated syncs", (await rows()).length === 5);
 
-    // Page: range form for managers only; a bad range is rejected before any sync.
+    // Page: everyone gets the date filter; only managers get Sync range, and a bad range is rejected before any sync.
     const members = await db.select().from(clientMembers).where(eq(clientMembers.clientId, clientId));
     const idOf = (role: string) => members.find((m) => m.role === role)!.userId;
     await db.insert(clientMembers).values([
@@ -165,22 +165,40 @@ async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
     ]);
     const ownerPage = (await (await owner.fetch(`/dashboard/clients/${c.id}`)).text()).replace(/<!-- -->/g, "");
     check(
-      "owner sees the date-range form and synced-through date",
-      ownerPage.includes("Sync a date range") && ownerPage.includes('name="from"') && ownerPage.includes(`payments synced through ${formatDay(through!)}`),
+      "owner sees the date-range form with Sync range and synced-through date",
+      ownerPage.includes("Filter or sync a date range") && ownerPage.includes('name="from"') && ownerPage.includes("Sync range") && ownerPage.includes(`payments synced through ${formatDay(through!)}`),
     );
-    const viewerPage = await (await viewer.fetch(`/dashboard/clients/${c.id}`)).text();
-    check("viewer doesn't see the date-range form", !viewerPage.includes("Sync a date range"));
-    const form = ownerPage.split("<form").find((f) => f.includes("Sync range"))!;
-    const fd = new FormData();
-    for (const m of form.matchAll(/<input[^>]*name="([^"]+)"(?:[^>]*value="([^"]*)")?/g)) fd.append(m[1], m[2] ?? "");
-    fd.set("from", "2026-02-01");
-    fd.set("to", "2026-01-01");
+    const viewerPage = (await (await viewer.fetch(`/dashboard/clients/${c.id}`)).text()).replace(/<!-- -->/g, "");
+    check(
+      "viewer sees the date filter but not Sync range",
+      viewerPage.includes("Filter by date range") && viewerPage.includes('name="from"') && viewerPage.includes("Show range") && !viewerPage.includes("Sync range"),
+    );
+    // Replay the Sync range button: it carries the bound Server Action (and client id) as hidden inputs.
+    const unescape = (v: string) => v.replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    const syncButton = ownerPage.match(/<button[^>]*name="(\$ACTION_REF_[^"]+)"[^>]*>([\s\S]*?)Sync range<\/button>/)!;
+    const syncRangeForm = (from: string, to: string) => {
+      const fd = new FormData();
+      fd.append(syncButton[1], "");
+      for (const m of syncButton[2].matchAll(/<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"/g)) fd.append(m[1], unescape(m[2]));
+      fd.set("from", from);
+      fd.set("to", to);
+      return fd;
+    };
     const before = (await conn()).lastSyncedAt?.getTime();
-    const res = await owner.fetch(`/dashboard/clients/${c.id}`, { method: "POST", body: fd });
+    const res = await owner.fetch(`/dashboard/clients/${c.id}`, { method: "POST", body: syncRangeForm("2026-02-01", "2026-01-01") });
     const loc = res.headers.get("location") ?? "";
     check("reversed date range is rejected with a message", loc.includes("error=bad_range"), `${res.status} ${loc}`);
     const after = await conn();
     check("rejected range didn't run a sync", after.lastSyncedAt?.getTime() === before && !after.lastSyncError);
+    const vres = await viewer.fetch(`/dashboard/clients/${c.id}`, { method: "POST", body: syncRangeForm("2026-01-01", "2026-01-02") });
+    const afterViewer = await conn();
+    check(
+      "viewer replaying Sync range is refused",
+      !(vres.headers.get("location") ?? "").includes("synced=") && afterViewer.lastSyncedAt?.getTime() === before && !afterViewer.lastSyncError,
+      `status ${vres.status}`,
+    );
+    const filtered = (await (await viewer.fetch(`/dashboard/clients/${c.id}?from=2000-01-01&to=2000-01-02`)).text()).replace(/<!-- -->/g, "");
+    check("viewer can filter by date (GET ?from&to)", filtered.includes("Showing payments from") && filtered.includes("No payments in this date range."));
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -297,6 +315,8 @@ async function main() {
     check("owner of A cannot connect client B", r.status === 403, `status ${r.status}`);
     r = await owner.fetch(`/dashboard/clients/${outsider[0].id}`);
     check("owner of A gets 404 on client B page", r.status === 404, `status ${r.status}`);
+    r = await owner.fetch("/dashboard");
+    check("owner of A doesn't see client B on the dashboard", r.status === 200 && !(await r.text()).includes(`E2E other ${tag}`));
     await db.delete(clients).where(eq(clients.id, outsider[0].id));
 
     // --- OAuth start/callback (Square unconfigured, Stripe with fake creds) ---

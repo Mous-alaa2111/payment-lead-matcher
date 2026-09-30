@@ -40,12 +40,15 @@ export function SubmitButton({
 }: ComponentProps<"button"> & { pendingText?: string; busy?: boolean }) {
   const { pending } = useFormStatus();
   const [navigating, setNavigating] = useState(false);
+  // A form can have several submit buttons; only the one that was pressed shows as busy.
+  const [submitter, setSubmitter] = useState(false);
   const ref = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     const form = ref.current?.form;
     if (!form) return;
     const onSubmit = (e: SubmitEvent) => {
+      setSubmitter(e.submitter === ref.current);
       if (e.submitter !== ref.current) return;
       // React cancels the native submit for Server Action forms; only a real post navigates.
       setTimeout(() => !e.defaultPrevented && setNavigating(true));
@@ -60,7 +63,7 @@ export function SubmitButton({
     };
   }, []);
 
-  const busy = busyProp || pending || navigating;
+  const busy = busyProp || (pending && submitter) || navigating;
   useBusyCursor(busy);
 
   return (

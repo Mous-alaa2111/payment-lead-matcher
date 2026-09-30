@@ -71,6 +71,13 @@ export async function disconnectAction(form: FormData) {
   revalidatePath(`/dashboard/clients/${clientId}`);
 }
 
+// "Sync range" on the date-range filter form. That form is a GET filter (so it
+// carries no clientId); the id comes bound from the page instead.
+export async function syncRangeAction(clientId: string, form: FormData) {
+  form.set("clientId", clientId);
+  return syncAction(form);
+}
+
 // Plain "Sync now" posts no dates and syncs everything since the last sync;
 // the date-range form posts from/to (YYYY-MM-DD) for a backfill or one period.
 export async function syncAction(form: FormData) {

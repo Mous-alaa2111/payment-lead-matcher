@@ -1,4 +1,5 @@
 import { and, count, desc, eq, gt, gte, isNull, lt } from "drizzle-orm";
+import Form from "next/form";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { db } from "@/db";
@@ -8,7 +9,7 @@ import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
 import { formatDay, parseRange } from "@/lib/sync/window";
-import { disconnectAction, revokeInviteAction, syncAction } from "./actions";
+import { disconnectAction, revokeInviteAction, syncAction, syncRangeAction } from "./actions";
 import { SubmitButton } from "@/components/submit-button";
 import { InviteForm } from "./invite-form";
 
@@ -120,7 +121,10 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
     `/dashboard/clients/${clientId}?${new URLSearchParams({ ...(range && { from: range.from, to: range.to }), page: String(n) })}`;
 
   const synced = search.synced && `Sync finished: ${search.synced} payment${search.synced === "1" ? "" : "s"} fetched`;
-  const flash = synced
+  const rangeError = parsedRange && "error" in parsedRange ? parsedRange.error : null;
+  const flash = rangeError
+    ? rangeError
+    : synced
     ? range
       ? `${synced} for ${range.from} to ${range.to} (UTC).`
       : `${synced}${search.since ? ` since ${search.since}` : ""}.`
@@ -206,14 +210,14 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             </form>
           )}
         </div>
-        {manage && square && (
+        {(square || total > 0 || range) && (
           <details open={!!range} className="group rounded-lg border border-panel-border px-4 py-3 text-sm">
-            <summary className="cursor-pointer text-zinc-500 group-open:text-brand-fg">Sync a date range</summary>
-            <form
-              key={range ? `${range.from}:${range.to}` : "all"}
-              action={syncAction}
-              className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
-              <input type="hidden" name="clientId" value={clientId} />
+            <summary className="cursor-pointer text-zinc-500 group-open:text-brand-fg">
+              {manage && square ? "Filter or sync a date range" : "Filter by date range"}
+            </summary>
+            {/* Everyone can filter (GET ?from=&to=); only managers get Sync range, which runs a sync. */}
+            <div key={range ? `${range.from}:${range.to}` : "all"}>
+            <Form action="" scroll={false} className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
               <label className="flex flex-col gap-1">
                 <span className="text-zinc-500">From</span>
                 <input
@@ -236,13 +240,25 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                   className="rounded-md border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
                 />
               </label>
-              <SubmitButton pendingText="Syncing…" className="rounded-md border px-3 py-2">
-                Sync range
+              <SubmitButton pendingText="Loading…" className="rounded-md border px-3 py-2">
+                Show range
               </SubmitButton>
-            </form>
+              {manage && square && (
+                <SubmitButton
+                  formAction={syncRangeAction.bind(null, clientId)}
+                  pendingText="Syncing…"
+                  className="rounded-md border px-3 py-2"
+                >
+                  Sync range
+                </SubmitButton>
+              )}
+            </Form>
+            </div>
             <p className="mt-2 text-xs text-zinc-500">
-              Dates are UTC and include both days. Use it to backfill a client&apos;s full history or re-sync one
-              period; plain Sync now keeps pulling everything since the last sync.
+              Dates are UTC and include both days. Show range filters the payments already here
+              {manage && square
+                ? "; Sync range first pulls that period from Square (to backfill history or re-sync). Plain Sync now keeps pulling everything since the last sync."
+                : "."}
             </p>
           </details>
         )}
