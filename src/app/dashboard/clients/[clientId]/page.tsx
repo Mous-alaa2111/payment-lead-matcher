@@ -8,10 +8,12 @@ import { canManage, getMembership, isUuid, requireSession } from "@/lib/access";
 import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
+import { PROVIDER_NAME } from "@/lib/sync";
 import { formatDay, parseRange } from "@/lib/sync/window";
 import { disconnectAction, revokeInviteAction, syncAction, syncRangeAction } from "./actions";
 import { SubmitButton } from "@/components/submit-button";
 import { InviteForm } from "./invite-form";
+import { RemoveClient } from "./remove-client";
 
 // Server Actions on this page (Sync now, date-range backfills) may run long.
 export const maxDuration = 300;
@@ -99,7 +101,11 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
       .where(inView)
       .groupBy(paymentMatches.status),
   ]);
-  const square = connections.find((c) => c.provider === "square");
+  // Every connected account gets synced; "Stripe and Square" etc. for labels.
+  const synced = [...connections].sort((a, b) => a.provider.localeCompare(b.provider));
+  const canSync = synced.length > 0;
+  const syncedNames = synced.map((c) => PROVIDER_NAME[c.provider]).join(" and ");
+  const utc = (d: Date) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
   const today = formatDay(new Date());
 
   // Summary counts cover every stored payment in view; the table shows one page of them.
@@ -117,17 +123,42 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         .limit(PAGE_SIZE)
         .offset((page - 1) * PAGE_SIZE)
     : [];
+  // Label each row's source only when a client has payments from both providers.
+  const mixedProviders = synced.length > 1 || new Set(matches.map((m) => m.provider)).size > 1;
+  // What "Remove client" would delete, spelled out in its confirmation dialog (agency staff only).
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const removalDeletes = membership.agency
+    ? [
+        "The client record and its GHL location and token",
+        plural(
+          range
+            ? (await db.select({ n: count() }).from(paymentMatches).where(eq(paymentMatches.clientId, clientId)))[0].n
+            : total,
+          "stored payment",
+        ) + " and their match results",
+        // Mirrors removeClientAction: OAuth connections are revoked, manual seeds only deleted here.
+        ...synced.map(
+          (c) =>
+            `The ${PROVIDER_NAME[c.provider]} connection` +
+            (c.scope === "manual-seed" ? " (the key stays valid elsewhere)" : `, and this app's access to that ${PROVIDER_NAME[c.provider]} account`),
+        ),
+        ...(members.length ? [`${plural(members.length, "team member")}' access to this client`] : []),
+        ...(pendingInvites.length ? [plural(pendingInvites.length, "pending invite")] : []),
+      ]
+    : [];
   const pageHref = (n: number) =>
     `/dashboard/clients/${clientId}?${new URLSearchParams({ ...(range && { from: range.from, to: range.to }), page: String(n) })}`;
 
-  const synced = search.synced && `Sync finished: ${search.synced} payment${search.synced === "1" ? "" : "s"} fetched`;
+  const syncDone =
+    search.synced && `Sync finished: ${search.synced} payment${search.synced === "1" ? "" : "s"} fetched`;
+  const partial = search.partial ? " One account failed to sync; the error is shown under Payments." : "";
   const rangeError = parsedRange && "error" in parsedRange ? parsedRange.error : null;
   const flash = rangeError
     ? rangeError
-    : synced
+    : syncDone
     ? range
-      ? `${synced} for ${range.from} to ${range.to} (UTC).`
-      : `${synced}${search.since ? ` since ${search.since}` : ""}.`
+      ? `${syncDone} for ${range.from} to ${range.to} (UTC).${partial}`
+      : `${syncDone}${search.since ? ` since ${search.since}` : ""}.${partial}`
     : Object.entries(search)
     .map(([k, v]) => MESSAGES[`${k}=${v}`] ?? (k === "error" ? `Something went wrong (${v}).` : null))
     .find(Boolean);
@@ -191,14 +222,15 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="font-medium">Payments</h2>
-            {square && (
-              <p className="text-sm text-zinc-500">
-                {square.lastSyncedAt ? `Last synced ${square.lastSyncedAt.toISOString().slice(0, 16).replace("T", " ")} UTC` : "Never synced"}
-                {square.syncedThrough && ` · payments synced through ${formatDay(square.syncedThrough)}`}
+            {synced.map((c) => (
+              <p key={c.provider} className="text-sm text-zinc-500">
+                {synced.length > 1 && `${PROVIDER_NAME[c.provider]}: `}
+                {c.lastSyncedAt ? `Last synced ${utc(c.lastSyncedAt)}` : "Never synced"}
+                {c.syncedThrough && ` · payments synced through ${formatDay(c.syncedThrough)}`}
               </p>
-            )}
+            ))}
           </div>
-          {manage && square && (
+          {manage && canSync && (
             <form action={syncAction}>
               <input type="hidden" name="clientId" value={clientId} />
               <SubmitButton
@@ -210,10 +242,10 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             </form>
           )}
         </div>
-        {(square || total > 0 || range) && (
+        {(canSync || total > 0 || range) && (
           <details open={!!range} className="group rounded-lg border border-panel-border px-4 py-3 text-sm">
             <summary className="cursor-pointer text-zinc-500 group-open:text-brand-fg">
-              {manage && square ? "Filter or sync a date range" : "Filter by date range"}
+              {manage && canSync ? "Filter or sync a date range" : "Filter by date range"}
             </summary>
             {/* Everyone can filter (GET ?from=&to=); only managers get Sync range, which runs a sync. */}
             <div key={range ? `${range.from}:${range.to}` : "all"}>
@@ -243,7 +275,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
               <SubmitButton pendingText="Loading…" className="rounded-md border px-3 py-2">
                 Show range
               </SubmitButton>
-              {manage && square && (
+              {manage && canSync && (
                 <SubmitButton
                   formAction={syncRangeAction.bind(null, clientId)}
                   pendingText="Syncing…"
@@ -256,17 +288,22 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             </div>
             <p className="mt-2 text-xs text-zinc-500">
               Dates are UTC and include both days. Show range filters the payments already here
-              {manage && square
-                ? "; Sync range first pulls that period from Square (to backfill history or re-sync). Plain Sync now keeps pulling everything since the last sync."
+              {manage && canSync
+                ? `; Sync range first pulls that period from ${syncedNames} (to backfill history or re-sync). Plain Sync now keeps pulling everything since the last sync.`
                 : "."}
             </p>
           </details>
         )}
-        {square?.lastSyncError && (
-          <p className="rounded-md border border-red-300 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:text-red-400">
-            Last sync failed: {square.lastSyncError}
-          </p>
-        )}
+        {synced
+          .filter((c) => c.lastSyncError)
+          .map((c) => (
+            <p
+              key={c.provider}
+              className="rounded-md border border-red-300 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:text-red-400"
+            >
+              Last {PROVIDER_NAME[c.provider]} sync failed: {c.lastSyncError}
+            </p>
+          ))}
         {range && (
           <p className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-brand-fg/30 bg-brand-soft px-4 py-2 text-sm">
             <span>
@@ -281,7 +318,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           <p className="rounded-lg border border-panel-border px-4 py-3 text-sm text-zinc-500">
             {range
               ? "No payments in this date range."
-              : square
+              : canSync
                 ? "No payments synced yet."
                 : "Connect a payment account to see payments here."}
           </p>
@@ -305,7 +342,12 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                 <tbody className="divide-y">
                   {matches.map((m) => (
                     <tr key={m.id} className="align-top">
-                      <td className="whitespace-nowrap px-4 py-2">{m.paidAt.toISOString().slice(0, 10)}</td>
+                      <td className="whitespace-nowrap px-4 py-2">
+                        {m.paidAt.toISOString().slice(0, 10)}
+                        {mixedProviders && (
+                          <span className="block text-xs text-zinc-500">{PROVIDER_NAME[m.provider]}</span>
+                        )}
+                      </td>
                       <td className="whitespace-nowrap px-4 py-2 text-right tabular-nums">
                         {money(m.amountCents, m.currency)}
                         {m.paymentStatus && m.paymentStatus !== "COMPLETED" && (
@@ -367,7 +409,12 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
 
       <section className="space-y-3 rounded-xl border border-panel-border bg-panel p-5 shadow-sm">
         <h2 className="font-medium">Team</h2>
-        <ul className="divide-y divide-panel-border rounded-lg border border-panel-border">
+        {members.length + pendingInvites.length === 0 && (
+          <p className="text-sm text-zinc-500">
+            No one from this client&apos;s team has been added yet.{manage && " Invite them below."}
+          </p>
+        )}
+        <ul className="divide-y divide-panel-border rounded-lg border border-panel-border empty:hidden">
           {members.map((m) => (
             <li key={m.email} className="flex justify-between px-4 py-3 text-sm">
               <span>
@@ -396,6 +443,18 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         </ul>
         {manage && <InviteForm clientId={clientId} canInviteOwner={role === "owner"} />}
       </section>
+
+      {membership.agency && (
+        <section className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-red-300/60 bg-panel p-5 shadow-sm dark:border-red-900/60">
+          <div>
+            <h2 className="font-medium">Remove client</h2>
+            <p className="text-sm text-zinc-500">
+              Permanently deletes this client and its payment history. Agency staff only.
+            </p>
+          </div>
+          <RemoveClient clientId={clientId} clientName={client.name} deletes={removalDeletes} />
+        </section>
+      )}
     </main>
   );
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import { SquareApi } from "./square";
+import { StripeApi, stripeChargeStatus } from "./stripe";
 import { FIRST_SYNC_DAYS, OVERLAP_DAYS, latestWindow, nextSyncedThrough, parseRange } from "./window";
 
 const DAY = 86_400_000;
@@ -132,5 +133,63 @@ describe("SquareApi paging", () => {
     globalThis.fetch = (async () =>
       new Response(JSON.stringify({ errors: [{ code: "UNAUTHORIZED", detail: "bad token" }] }), { status: 401 })) as typeof fetch;
     await assert.rejects(new SquareApi("t", true).activeLocationIds(), /401 bad token/);
+  });
+});
+
+describe("StripeApi paging", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("pages with starting_after, passes the window and expands customers", async () => {
+    const calls: { url: URL; headers: Record<string, string> }[] = [];
+    const pages: Record<string, { data: { id: string }[]; has_more: boolean }> = {
+      "": { data: [{ id: "ch_3" }, { id: "ch_2" }], has_more: true },
+      ch_2: { data: [{ id: "ch_1" }], has_more: false },
+    };
+    globalThis.fetch = (async (input: URL, init: RequestInit) => {
+      calls.push({ url: input, headers: init.headers as Record<string, string> });
+      return new Response(JSON.stringify(pages[input.searchParams.get("starting_after") ?? ""]), { status: 200 });
+    }) as typeof fetch;
+
+    const start = new Date("2026-01-01T00:00:00Z");
+    const end = new Date("2026-02-01T00:00:00Z");
+    const got = await new StripeApi("sk_platform", "acct_123").charges(start, end);
+    assert.deepEqual(got.map((c) => c.id), ["ch_3", "ch_2", "ch_1"]);
+    assert.equal(calls.length, 2);
+    for (const { url, headers } of calls) {
+      assert.equal(url.pathname, "/v1/charges");
+      assert.equal(url.searchParams.get("created[gte]"), String(start.getTime() / 1000));
+      assert.equal(url.searchParams.get("created[lt]"), String(end.getTime() / 1000));
+      assert.equal(url.searchParams.get("expand[]"), "data.customer");
+      assert.equal(url.searchParams.get("limit"), "100");
+      assert.equal(headers.Authorization, "Bearer sk_platform");
+      assert.equal(headers["Stripe-Account"], "acct_123"); // Connect: platform key + account header
+    }
+  });
+
+  it("uses no Stripe-Account header with an account's own key", async () => {
+    let headers: Record<string, string> = {};
+    globalThis.fetch = (async (_input: URL, init: RequestInit) => {
+      headers = init.headers as Record<string, string>;
+      return new Response(JSON.stringify({ data: [], has_more: false }), { status: 200 });
+    }) as typeof fetch;
+    await new StripeApi("sk_test_own", null).charges(new Date(0), new Date(1000));
+    assert.equal(headers["Stripe-Account"], undefined);
+  });
+
+  it("surfaces Stripe errors", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: { message: "Invalid API Key provided" } }), { status: 401 })) as typeof fetch;
+    await assert.rejects(new StripeApi("sk_bad", null).charges(new Date(0), new Date()), /401 Invalid API Key/);
+  });
+
+  it("maps charge status and refunds to the table's statuses", () => {
+    assert.equal(stripeChargeStatus({ status: "succeeded" }), "COMPLETED");
+    assert.equal(stripeChargeStatus({ status: "pending" }), "PENDING");
+    assert.equal(stripeChargeStatus({ status: "failed" }), "FAILED");
+    assert.equal(stripeChargeStatus({ status: "succeeded", refunded: true, amount_refunded: 500 }), "REFUNDED");
+    assert.equal(stripeChargeStatus({ status: "succeeded", amount_refunded: 200 }), "PARTIALLY_REFUNDED");
   });
 });

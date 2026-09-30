@@ -13,8 +13,9 @@ const list = "divide-y divide-panel-border rounded-lg border border-panel-border
 const smallButton =
   "rounded-md border px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800";
 
-export default async function DashboardPage() {
+export default async function DashboardPage(props: PageProps<"/dashboard">) {
   const session = await requireSession();
+  const { removed } = await props.searchParams;
   const agency = await isAgencyStaff(session.user.id);
 
   // Agency staff see every client; everyone else only the clients they belong to.
@@ -58,6 +59,12 @@ export default async function DashboardPage() {
         </div>
         <SignOutButton />
       </header>
+
+      {typeof removed === "string" && (
+        <p className="rounded-md border border-panel-border bg-panel px-4 py-2 text-sm">
+          Removed <strong>{removed}</strong> and all of its stored data.
+        </p>
+      )}
 
       <section className={agency ? card : undefined}>
         <h2 className="mb-2 font-medium">{agency ? "All clients" : "Your clients"}</h2>

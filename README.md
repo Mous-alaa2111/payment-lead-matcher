@@ -53,6 +53,23 @@ npm run invite -- --email new@elkocreative.com --agency     # no account yet
 
 Invites are links to copy and send; the app doesn't email them yet.
 
+Only agency staff see **Remove client** (bottom of a client's page). After a confirmation
+dialog it deletes the client and, via `ON DELETE CASCADE`, its stored payments and match
+results, Stripe/Square connection records, team memberships and pending invites. OAuth
+connections are revoked first (like Disconnect); manually seeded keys are not. User
+accounts and anything in GHL, Stripe or Square are untouched.
+
+## Syncing payments
+
+Sync now / Sync range (and `npm run sync -- --client <slug> [--provider stripe|square]`)
+sync every connected account. Stripe reads charges with the customer expanded and matches
+email-first; Square matches phone-first (same rules as stripe-crm-sync). A Stripe Connect
+account is read with `STRIPE_SECRET_KEY` + `Stripe-Account`; to test before Connect exists,
+`scripts/seed-manual-stripe.ts --client <slug>` stores the GHL .env's `STRIPE_TEST_SECRET_KEY`
+as that client's connection (the e2e branch has one on Essential Auto Werks, the location
+stripe-crm-sync's Stripe fixtures were built against).
+
+
 ## End-to-end tests (separate Neon branch)
 
 `npm run test:e2e` never runs against the production database. It reads `DATABASE_URL`

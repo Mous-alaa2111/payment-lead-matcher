@@ -204,6 +204,88 @@ async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
   }
 }
 
+// Runs Stripe sync in-process with fetch faked for Stripe and GHL only. Two
+// charge pages exercise starting_after paging. Ann's email and phone point at
+// different leads, proving Stripe matches email-first (Square would pick phone).
+async function stripeSyncChecks(tag: string, owner: Jar, ownerId: string) {
+  const { and, eq } = await import("drizzle-orm");
+  const { db } = await import("../src/db");
+  const { clients, clientMembers, paymentConnections, paymentMatches } = await import("../src/db/schema");
+  const { encrypt } = await import("../src/lib/crypto");
+  const { syncClient } = await import("../src/lib/sync");
+
+  const ago = (d: number) => Math.floor((Date.now() - d * 86_400_000) / 1000);
+  const charges = [
+    { id: "ch_a", created: ago(1), amount: 1500, currency: "usd", status: "succeeded",
+      customer: { id: "cus_a", name: "Ann Payer", email: "ann@example.com", phone: "+15550000009" }, billing_details: {} },
+    { id: "ch_b", created: ago(2), amount: 2500, currency: "usd", status: "succeeded", refunded: true, amount_refunded: 2500,
+      customer: { id: "cus_b", deleted: true }, billing_details: { name: "Bob Billing", email: "bob@example.com" } },
+    { id: "ch_c", created: ago(3), amount: 3500, currency: "usd", status: "failed", customer: null,
+      billing_details: { email: "nobody@example.com" } },
+  ];
+  const ghl = [
+    { id: "g-ann-email", firstName: "Ann", lastName: "ByEmail", email: "ann@example.com" },
+    { id: "g-ann-phone", firstName: "Other", lastName: "ByPhone", phone: "+15550000009" },
+    { id: "g-bob", firstName: "Bob", lastName: "Lead", email: "bob@example.com" },
+  ];
+  const chargeCalls: { url: URL; account?: string }[] = [];
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const json = (b: object) => new Response(JSON.stringify(b), { status: 200 });
+    if (url.hostname === "api.stripe.com" && url.pathname === "/v1/charges") {
+      chargeCalls.push({ url, account: (init?.headers as Record<string, string>)["Stripe-Account"] });
+      return url.searchParams.get("starting_after") === "ch_b"
+        ? json({ data: charges.slice(2), has_more: false })
+        : json({ data: charges.slice(0, 2), has_more: true });
+    }
+    if (url.hostname === "services.leadconnectorhq.com") return json({ contacts: ghl, meta: {} });
+    return realFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    const [c] = await db
+      .insert(clients)
+      .values({ name: `E2E stripe ${tag}`, slug: `${tag}-stripe`, ghlLocationId: `${tag}-sloc`, ghlTokenEnc: encrypt("fake-pit") })
+      .returning();
+    await db.insert(clientMembers).values({ clientId: c.id, userId: ownerId, role: "owner" });
+    await db.insert(paymentConnections).values([
+      { clientId: c.id, provider: "stripe", externalAccountId: "acct_e2e", accessTokenEnc: encrypt("sk_test_fake"), livemode: false, scope: "manual-seed" },
+      // A Square connection with no token: its sync fails, Stripe's must still run.
+      { clientId: c.id, provider: "square", externalAccountId: `${tag}-sq`, livemode: false },
+    ]);
+
+    const results = await syncClient(c.id);
+    const stripe = results.find((r) => r.provider === "stripe");
+    const square = results.find((r) => r.provider === "square");
+    check("Stripe sync pages through every charge", stripe?.summary?.payments === 3 && chargeCalls.length === 2, stripe?.error);
+    check("seeded Stripe key is used without a Stripe-Account header", chargeCalls.every((call) => call.account === undefined));
+    check("one provider failing doesn't stop the other", Boolean(square?.error) && Boolean(stripe?.summary));
+
+    const rows = Object.fromEntries(
+      (await db.select().from(paymentMatches).where(and(eq(paymentMatches.clientId, c.id), eq(paymentMatches.provider, "stripe"))))
+        .map((r) => [r.externalPaymentId, r]),
+    );
+    check("Stripe is email-first: email lead wins over a different phone lead",
+      rows.ch_a?.status === "matched" && rows.ch_a.method === "email" && rows.ch_a.contacts[0]?.id === "g-ann-email");
+    check("deleted customer falls back to billing email and name; refund shown",
+      rows.ch_b?.status === "matched" && rows.ch_b.contacts[0]?.id === "g-bob" && rows.ch_b.payerName === "Bob Billing" && rows.ch_b.paymentStatus === "REFUNDED");
+    check("unknown payer is no_match; failed charge keeps its status",
+      rows.ch_c?.status === "no_match" && rows.ch_c.paymentStatus === "FAILED" && rows.ch_c.currency === "USD");
+
+    const conns = Object.fromEntries(
+      (await db.select().from(paymentConnections).where(eq(paymentConnections.clientId, c.id))).map((r) => [r.provider, r]),
+    );
+    check("each connection records its own sync result", !conns.stripe.lastSyncError && Boolean(conns.stripe.lastSyncedAt) && Boolean(conns.square.lastSyncError));
+    const page = (await (await owner.fetch(`/dashboard/clients/${c.id}`)).text()).replace(/<!-- -->/g, "");
+    check("page shows per-provider sync status, error and row source",
+      page.includes("Stripe: Last synced") && page.includes("Last Square sync failed:") && page.includes(">Stripe</span>"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 async function main() {
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
@@ -366,7 +448,7 @@ async function main() {
     const syncError = await syncSquare(client.id).then(() => null, (e: Error) => e.message);
     check("sync without GHL creds fails before calling any API", Boolean(syncError?.includes("no GHL location")), syncError ?? "");
     let page = await (await owner.fetch(`/dashboard/clients/${client.id}`)).text();
-    check("sync failure is shown on the page", page.includes("Last sync failed:") && page.includes("no GHL location"));
+    check("sync failure is shown on the page", page.includes("sync failed:") && page.includes("no GHL location"));
 
     const contact = { id: "c1", name: "Pat Lead", email: null, phone: "+15550001111" };
     await db.insert(paymentMatches).values([
@@ -469,7 +551,11 @@ async function main() {
     await staff2.signUp(staff2Email, tokenOf((await createInvitation({ email: staff2Email, clientId: null, role: "viewer", agencyStaff: true, invitedBy: staffRow.id })).url));
     check("second staff member sees the client", (await staff2.fetch(`/dashboard/clients/${client.id}`)).status === 200);
     dash = (await (await staff.fetch("/dashboard")).text()).replace(/<!-- -->/g, "");
-    check("staff can't remove themselves (no Remove on own row)", (dash.match(/>Remove</g) ?? []).length === 1);
+    // Look only at each staff row, so leftover staff from other runs can't skew it.
+    const rowFor = (email: string) =>
+      dash.split(/<li[ >]/).slice(1).find((li) => li.includes(email))?.split("</li>")[0] ?? "";
+    check("staff can't remove themselves (no Remove on own row)",
+      !rowFor(staffEmail).includes(">Remove<") && rowFor(staffEmail).includes("you") && rowFor(staff2Email).includes(">Remove<"));
     const [staff2Row] = await db.select().from(user).where(eq(user.email, staff2Email));
     const selfRemove = formFields(dash, "Remove");
     selfRemove.set("userId", staffRow.id);
@@ -485,10 +571,51 @@ async function main() {
 
     // --- Sync windows, paging and re-matching (real sync code; Square + GHL faked in-process) ---
     await syncWindowChecks(client.id, owner, viewer);
+
+    // --- Stripe sync (real sync code; Stripe + GHL faked in-process) ---
+    await stripeSyncChecks(tag, owner, ownerRow.id);
+
+    // --- Remove client: agency staff only, behind a dialog; cascades to everything stored for it ---
+    const [doomed] = await db.insert(clients).values({ name: `E2E remove ${tag}`, slug: `${tag}-remove` }).returning();
+    await db.insert(clientMembers).values({ clientId: doomed.id, userId: ownerRow.id, role: "owner" });
+    await db.insert(paymentConnections).values({
+      clientId: doomed.id, provider: "square", externalAccountId: `${tag}-rm`, accessTokenEnc: encrypt("x"), livemode: false, scope: "manual-seed",
+    });
+    await db.insert(paymentMatches).values({
+      clientId: doomed.id, provider: "square", externalPaymentId: "rm1", paidAt: new Date(), amountCents: 100, currency: "USD", status: "no_match",
+    });
+    await createInvitation({ email: `${tag}-rm-invitee@example.com`, clientId: doomed.id, role: "viewer", invitedBy: null });
+    const ownerView = await (await owner.fetch(`/dashboard/clients/${doomed.id}`)).text();
+    check("client owner doesn't see Remove client", !ownerView.includes("Remove client"));
+    const staffView = (await (await staff.fetch(`/dashboard/clients/${doomed.id}`)).text()).replace(/<!-- -->/g, "");
+    check(
+      "staff see Remove client, with a dialog listing what it deletes",
+      staffView.includes("Remove client") && staffView.includes("<dialog") && staffView.includes("undone") &&
+        staffView.includes("1 stored payment and their match results") && staffView.includes("The Square connection") &&
+        staffView.includes("1 team member") && staffView.includes("1 pending invite"),
+    );
+    const removeForm = formFields(staffView, "Cancel");
+    await owner.fetch(`/dashboard/clients/${doomed.id}`, { method: "POST", body: removeForm });
+    check("client owner can't remove a client (replayed action refused)",
+      (await db.select().from(clients).where(eq(clients.id, doomed.id))).length === 1);
+    r = await staff.fetch(`/dashboard/clients/${doomed.id}`, { method: "POST", body: removeForm });
+    const left = await Promise.all([
+      db.select().from(clients).where(eq(clients.id, doomed.id)),
+      db.select().from(clientMembers).where(eq(clientMembers.clientId, doomed.id)),
+      db.select().from(paymentConnections).where(eq(paymentConnections.clientId, doomed.id)),
+      db.select().from(paymentMatches).where(eq(paymentMatches.clientId, doomed.id)),
+      db.select().from(invitations).where(eq(invitations.clientId, doomed.id)),
+    ]);
+    check("staff remove deletes the client, its payments, connections, memberships and invites",
+      left.every((rows) => rows.length === 0), left.map((rows) => rows.length).join(","));
+    check("removing a client keeps its team's user accounts", (await db.select().from(user).where(eq(user.id, ownerRow.id))).length === 1);
+    check("removal redirects to the dashboard with a message", (r.headers.get("location") ?? "").includes("/dashboard?removed="), `${r.status}`);
   } finally {
     await db.delete(user).where(like(user.email, `${tag}-%`));
     await db.delete(invitations).where(like(invitations.email, `${tag}-%`));
-    await db.delete(clients).where(inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`]));
+    await db.delete(clients).where(
+      inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`, `${tag}-stripe`, `${tag}-remove`]),
+    );
   }
 
   // Encryption round trip

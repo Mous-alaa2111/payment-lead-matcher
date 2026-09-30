@@ -4,12 +4,12 @@ import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { db } from "@/db";
-import { paymentConnections } from "@/db/schema";
-import { canManage, getMembership, isUuid, requireSession, type ClientRole } from "@/lib/access";
+import { clients, paymentConnections } from "@/db/schema";
+import { canManage, getMembership, isUuid, requireAgencyStaff, requireSession, type ClientRole } from "@/lib/access";
 import { revokeSquare } from "@/lib/connect/square";
 import { deauthorizeStripe } from "@/lib/connect/stripe";
 import { canManageInviteRole, createInvitation, revokeInvitation } from "@/lib/invitations";
-import { syncSquare } from "@/lib/sync";
+import { syncClient } from "@/lib/sync";
 import { formatDay, parseRange, type SyncWindow } from "@/lib/sync/window";
 
 const ROLES: ClientRole[] = ["owner", "admin", "viewer"];
@@ -94,20 +94,50 @@ export async function syncAction(form: FormData) {
     range = parsed;
   }
 
-  // The error itself is stored on the connection and shown on the page.
+  // Every connected account is synced; each one's error is stored on its
+  // connection and shown on the page.
+  const results = await syncClient(clientId, range);
+  const done = results.flatMap((r) => (r.summary ? [r.summary] : []));
   let result: string;
-  try {
-    const s = await syncSquare(clientId, range);
-    // A range sync filters the table to that range (from/to); Sync now shows everything.
-    result = new URLSearchParams(
-      range
-        ? { synced: String(s.payments), from: from.trim(), to: to.trim() }
-        : { synced: String(s.payments), since: formatDay(s.window.start) },
-    ).toString();
-  } catch (err) {
-    console.error("[sync:square]", err);
+  if (!done.length) {
     result = "error=sync_failed";
+  } else {
+    const synced = String(done.reduce((n, s) => n + s.payments, 0));
+    const since = formatDay(new Date(Math.min(...done.map((s) => s.window.start.getTime()))));
+    // A range sync filters the table to that range (from/to); Sync now shows everything.
+    result = new URLSearchParams({
+      synced,
+      ...(range ? { from: from.trim(), to: to.trim() } : { since }),
+      ...(done.length < results.length ? { partial: "1" } : {}),
+    }).toString();
   }
   revalidatePath(page);
   redirect(`${page}?${result}`);
+}
+
+// Agency staff only. Permanently deletes the client and, through the foreign
+// keys' ON DELETE CASCADE, everything stored for it: payments and match
+// results, Stripe/Square connection records, team memberships and pending
+// invites. User accounts, other clients, and anything in GHL, Stripe or Square
+// are left alone. OAuth connections are revoked first, as Disconnect does;
+// manually seeded ones are skipped because their keys are shared with other tools.
+export async function removeClientAction(clientId: string) {
+  await requireAgencyStaff();
+  if (!isUuid(clientId)) throw new Error("Bad client id");
+  const [client] = await db.select({ name: clients.name }).from(clients).where(eq(clients.id, clientId));
+  if (!client) redirect("/dashboard");
+
+  const conns = await db.select().from(paymentConnections).where(eq(paymentConnections.clientId, clientId));
+  for (const conn of conns) {
+    if (conn.scope === "manual-seed") continue;
+    try {
+      if (conn.provider === "stripe") await deauthorizeStripe(conn.externalAccountId);
+      else await revokeSquare(conn.externalAccountId);
+    } catch (err) {
+      console.error(`[remove-client:${conn.provider}] provider revoke failed`, err);
+    }
+  }
+  await db.delete(clients).where(eq(clients.id, clientId));
+  revalidatePath("/dashboard");
+  redirect(`/dashboard?${new URLSearchParams({ removed: client.name })}`);
 }
