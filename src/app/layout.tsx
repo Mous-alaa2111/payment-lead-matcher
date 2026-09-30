@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import Image from "next/image";
 import Link from "next/link";
+import elkoMark from "../../public/elko-mark.png";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -25,8 +27,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        <header className="px-6 py-4">
-          <Link href="/" className="text-lg font-bold tracking-tight">
+        <header className="px-6 pt-6 pb-2 sm:px-8">
+          <Link href="/" className="inline-flex items-center gap-2.5 text-xl font-bold tracking-tight">
+            <Image src={elkoMark} alt="" height={36} loading="eager" />
             Elko Creative
           </Link>
         </header>
