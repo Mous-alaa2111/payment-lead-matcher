@@ -164,7 +164,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
     .find(Boolean);
 
   return (
-    <main className="mx-auto max-w-5xl space-y-8 px-4 py-10">
+    <main className="mx-auto w-full max-w-5xl space-y-8 px-4 py-10">
       <header>
         <Link href="/dashboard" className="text-sm text-brand-fg hover:underline">
           ← All clients

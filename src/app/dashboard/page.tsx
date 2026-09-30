@@ -48,7 +48,7 @@ export default async function DashboardPage(props: PageProps<"/dashboard">) {
     : [[], []];
 
   return (
-    <main className="mx-auto max-w-3xl space-y-6 px-4 py-10">
+    <main className="mx-auto w-full max-w-3xl space-y-6 px-4 py-10">
       <header className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Dashboard</h1>

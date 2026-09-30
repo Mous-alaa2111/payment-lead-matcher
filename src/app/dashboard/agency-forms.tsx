@@ -12,21 +12,23 @@ export function NewClientForm() {
   return (
     <form action={formAction} className="space-y-2">
       <div className="flex flex-col gap-2 sm:flex-row">
-        <input name="name" required placeholder="Business name" className={`flex-1 ${input}`} />
-        <input name="ghlLocationId" placeholder="GHL location ID (optional)" className={`flex-1 ${input}`} />
+        {/* min-w-0 lets the inputs shrink below their placeholder width so the button stays inside the card. */}
+        <input name="name" required placeholder="Business name" className={`min-w-0 sm:flex-[3] ${input}`} />
+        <input name="ghlLocationId" placeholder="GHL location ID" className={`min-w-0 sm:flex-[2] ${input}`} />
         <input
           name="ghlToken"
           type="password"
           autoComplete="off"
-          placeholder="GHL private integration token (optional)"
-          className={`flex-1 ${input}`}
+          placeholder="GHL token"
+          aria-label="GHL private integration token"
+          className={`min-w-0 sm:flex-[2] ${input}`}
         />
-        <SubmitButton busy={pending} pendingText="Creating…" className={primary}>
+        <SubmitButton busy={pending} pendingText="Creating…" className={`shrink-0 ${primary}`}>
           Create client
         </SubmitButton>
       </div>
       <p className="text-xs text-zinc-500">
-        The GHL location and token are needed for matching; you can add the client first and fill them in later.
+        GHL location ID and private integration token are optional here, but a client needs both before its payments can be synced and matched.
       </p>
       {state.error && <p className="text-sm text-red-600">{state.error}</p>}
     </form>
