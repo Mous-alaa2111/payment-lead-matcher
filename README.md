@@ -35,6 +35,24 @@ The easiest way to deploy your Next.js app is to use the [Vercel Platform](https
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
 
+## Access: agency staff vs. client roles
+
+- **Agency staff** (Elko Creative, table `agency_staff`) see and manage every client,
+  acting as owner on each, and can create clients and invite more staff from the
+  dashboard. They have no per-client membership and don't appear in a client's Team list.
+- **Client roles** (`client_members`: owner / admin / viewer) only ever cover that one
+  client's own business. Owners and admins manage it and invite its team; viewers are read-only.
+
+Bootstrap staff from the CLI (production `.env.local`):
+
+```bash
+npm run staff -- --list
+npm run staff -- --add you@example.com --drop-memberships   # existing account
+npm run invite -- --email new@elkocreative.com --agency     # no account yet
+```
+
+Invites are links to copy and send; the app doesn't email them yet.
+
 ## End-to-end tests (separate Neon branch)
 
 `npm run test:e2e` never runs against the production database. It reads `DATABASE_URL`

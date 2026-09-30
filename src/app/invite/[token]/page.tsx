@@ -24,7 +24,11 @@ export default async function InvitePage(props: PageProps<"/invite/[token]">) {
   const [client] = invite.clientId
     ? await db.select({ name: clients.name }).from(clients).where(eq(clients.id, invite.clientId))
     : [];
-  const what = client ? `${client.name} (${invite.role})` : "Payment Lead Matcher";
+  const what = invite.agencyStaff
+    ? "the Elko Creative agency team (access to every client)"
+    : client
+      ? `${client.name} (${invite.role})`
+      : "Payment Lead Matcher";
 
   const session = await getSession();
   if (session) {

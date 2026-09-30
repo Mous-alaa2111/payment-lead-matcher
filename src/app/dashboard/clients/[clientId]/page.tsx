@@ -139,7 +139,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           ← All clients
         </Link>
         <h1 className="mt-1 text-2xl font-semibold">{client.name}</h1>
-        <p className="text-sm text-zinc-500">Your role: {role}</p>
+        <p className="text-sm text-zinc-500">Your role: {membership.agency ? "agency staff" : role}</p>
       </header>
 
       {flash && <p className="rounded-md border border-panel-border bg-panel px-4 py-2 text-sm">{flash}</p>}

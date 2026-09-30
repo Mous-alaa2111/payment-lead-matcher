@@ -33,11 +33,12 @@ export const clients = pgTable("clients", {
     .notNull(),
 });
 
-// owner/admin = agency staff or the client's account owner; viewer = read-only.
+// owner/admin = the client's account owner / managers; viewer = read-only.
+// Agency staff don't need a role here: see agencyStaff below.
 export const clientRole = pgEnum("client_role", ["owner", "admin", "viewer"]);
 
-// Which users can see which clients. Agency users get a row per client they
-// manage; a client's own staff only get rows for their business.
+// Which users can see which clients: a client's own team, one row per business
+// they belong to. Agency staff get access through agencyStaff instead.
 export const clientMembers = pgTable(
   "client_members",
   {
@@ -56,8 +57,20 @@ export const clientMembers = pgTable(
   ],
 );
 
+// Agency staff (Elko Creative): see and manage every client, acting as owner on
+// each, without a client_members row. Separate from per-client roles on purpose,
+// so a client's own team never gains agency-wide access.
+export const agencyStaff = pgTable("agency_staff", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  addedBy: text("added_by").references(() => user.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
 // Sign-up is invite-only. The raw token only ever exists in the invite link;
-// we store its SHA-256. clientId null = account only, no client membership.
+// we store its SHA-256. clientId null = account only, no client membership;
+// agencyStaff = accepting makes the user agency staff (clientId is then null).
 export const invitations = pgTable(
   "invitations",
   {
@@ -65,6 +78,7 @@ export const invitations = pgTable(
     email: text("email").notNull(), // always stored lowercased
     clientId: uuid("client_id").references(() => clients.id, { onDelete: "cascade" }),
     role: clientRole("role").notNull().default("viewer"),
+    agencyStaff: boolean("agency_staff").notNull().default(false),
     tokenHash: text("token_hash").notNull().unique(),
     invitedBy: text("invited_by").references(() => user.id, { onDelete: "set null" }),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),

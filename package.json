@@ -12,6 +12,7 @@
     "db:check:e2e": "tsx scripts/e2e-db.ts tsx scripts/db-check.ts",
     "db:counts": "tsx scripts/db-counts.ts",
     "invite": "tsx scripts/invite.ts",
+    "staff": "tsx scripts/staff.ts",
     "sync": "tsx scripts/sync.ts",
     "seed:manual-square": "tsx scripts/seed-manual-square.ts",
     "test:e2e": "tsx scripts/e2e.ts",

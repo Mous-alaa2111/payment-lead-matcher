@@ -207,7 +207,7 @@ async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
 async function main() {
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
-  const { clients, clientMembers, invitations, paymentConnections, paymentMatches, user } = await import("../src/db/schema");
+  const { agencyStaff, clients, clientMembers, invitations, paymentConnections, paymentMatches, user } = await import("../src/db/schema");
   const { createInvitation, findPendingInvitation, revokeInvitation } = await import("../src/lib/invitations");
   const { encrypt, decrypt } = await import("../src/lib/crypto");
 
@@ -415,12 +415,80 @@ async function main() {
     check("out-of-range page clamps to the last page", (await payPage("?page=99")).html.includes("Page 3 of 3"));
     check("junk page param falls back to page 1", (await payPage("?page=abc")).html.includes("Page 1 of 3"));
 
+    // --- Agency staff: every client without per-client membership; agency-only actions ---
+    // Replays a no-JS form submission (Server Action ids travel as hidden inputs).
+    const unescapeHtml = (v: string) =>
+      v.replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    const formFields = (html: string, marker: string) => {
+      const form = html.split("<form").find((f) => f.split("</form>")[0].includes(marker));
+      if (!form) throw new Error(`no form with ${marker}`);
+      const fd = new FormData();
+      for (const m of form.split("</form>")[0].matchAll(/<input([^>]*)>/g)) {
+        const name = m[1].match(/name="([^"]+)"/)?.[1];
+        if (name) fd.append(name, unescapeHtml(m[1].match(/value="([^"]*)"/)?.[1] ?? ""));
+      }
+      return fd;
+    };
+    const staffEmail = `${tag}-staff@example.com`;
+    const staffInvite = await createInvitation({ email: staffEmail, clientId: null, role: "viewer", agencyStaff: true, invitedBy: null });
+    const staffInvitePage = await (await anon.fetch(`/invite/${tokenOf(staffInvite.url)}`)).text();
+    check("staff invite page names the agency team", staffInvitePage.includes("agency team"));
+    const staff = new Jar();
+    r = await staff.signUp(staffEmail, tokenOf(staffInvite.url));
+    const [staffRow] = await db.select().from(user).where(eq(user.email, staffEmail));
+    const staffRows = await db.select().from(agencyStaff).where(eq(agencyStaff.userId, staffRow.id));
+    const staffMemberships = await db.select().from(clientMembers).where(eq(clientMembers.userId, staffRow.id));
+    check("staff invite makes agency staff with no client memberships", r.status === 200 && staffRows.length === 1 && staffMemberships.length === 0);
+
+    let dash = (await (await staff.fetch("/dashboard")).text()).replace(/<!-- -->/g, "");
+    check("staff dashboard lists every client", dash.includes(`E2E ${tag}`) && dash.includes("All clients"));
+    check("staff dashboard has New client and Agency team", dash.includes("Create client") && dash.includes("Agency team") && dash.includes(staffEmail));
+    r = await staff.fetch(`/dashboard/clients/${client.id}`);
+    const staffClientPage = (await r.text()).replace(/<!-- -->/g, "");
+    check("staff opens a client they aren't a member of, as agency staff",
+      r.status === 200 && staffClientPage.includes("Your role: agency staff") && staffClientPage.includes("Create invite"));
+    check("staff can manage payment connections", staffClientPage.includes('action="/api/connect/stripe/start"'));
+    r = await staff.post("/api/connect/stripe/start", { clientId: client.id });
+    check("staff can start OAuth for any client", r.status === 303 && (r.headers.get("location") ?? "").includes("stripe.com"), `${r.status}`);
+    const ownerClientPage = await (await owner.fetch(`/dashboard/clients/${client.id}`)).text();
+    check("staff don't appear in the client's Team list", !ownerClientPage.includes(staffEmail));
+
+    const ownerDash = await (await owner.fetch("/dashboard")).text();
+    check("client owner's dashboard has no agency controls", !ownerDash.includes("Agency team") && !ownerDash.includes("Create client") && ownerDash.includes("Your clients"));
+    const newClient = formFields(dash, "Create client");
+    newClient.set("name", `${tag} new`);
+    await owner.fetch("/dashboard", { method: "POST", body: newClient });
+    check("client owner can't create clients (replayed action refused)",
+      (await db.select().from(clients).where(eq(clients.slug, `${tag}-new`))).length === 0);
+    r = await staff.fetch("/dashboard", { method: "POST", body: newClient });
+    const [created] = await db.select().from(clients).where(eq(clients.slug, `${tag}-new`));
+    check("staff can create a client", Boolean(created), `status ${r.status}`);
+
+    const staff2Email = `${tag}-staff2@example.com`;
+    const staff2 = new Jar();
+    await staff2.signUp(staff2Email, tokenOf((await createInvitation({ email: staff2Email, clientId: null, role: "viewer", agencyStaff: true, invitedBy: staffRow.id })).url));
+    check("second staff member sees the client", (await staff2.fetch(`/dashboard/clients/${client.id}`)).status === 200);
+    dash = (await (await staff.fetch("/dashboard")).text()).replace(/<!-- -->/g, "");
+    check("staff can't remove themselves (no Remove on own row)", (dash.match(/>Remove</g) ?? []).length === 1);
+    const [staff2Row] = await db.select().from(user).where(eq(user.email, staff2Email));
+    const selfRemove = formFields(dash, "Remove");
+    selfRemove.set("userId", staffRow.id);
+    await staff.fetch("/dashboard", { method: "POST", body: selfRemove });
+    check("replayed self-removal is ignored", (await db.select().from(agencyStaff).where(eq(agencyStaff.userId, staffRow.id))).length === 1);
+    const removeOther = formFields(dash, "Remove");
+    removeOther.set("userId", staff2Row.id);
+    await owner.fetch("/dashboard", { method: "POST", body: removeOther });
+    check("client owner can't remove agency staff", (await db.select().from(agencyStaff).where(eq(agencyStaff.userId, staff2Row.id))).length === 1);
+    await staff.fetch("/dashboard", { method: "POST", body: removeOther });
+    check("staff removes another staff member", (await db.select().from(agencyStaff).where(eq(agencyStaff.userId, staff2Row.id))).length === 0);
+    check("removed staff lose access to clients", (await staff2.fetch(`/dashboard/clients/${client.id}`)).status === 404);
+
     // --- Sync windows, paging and re-matching (real sync code; Square + GHL faked in-process) ---
     await syncWindowChecks(client.id, owner, viewer);
   } finally {
     await db.delete(user).where(like(user.email, `${tag}-%`));
     await db.delete(invitations).where(like(invitations.email, `${tag}-%`));
-    await db.delete(clients).where(inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`]));
+    await db.delete(clients).where(inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`]));
   }
 
   // Encryption round trip

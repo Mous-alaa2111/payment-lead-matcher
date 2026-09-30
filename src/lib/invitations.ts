@@ -1,6 +1,6 @@
 import { and, eq, gt, isNull } from "drizzle-orm";
 import { db } from "@/db";
-import { clientMembers, invitations } from "@/db/schema";
+import { agencyStaff, clientMembers, invitations } from "@/db/schema";
 import type { ClientRole } from "@/lib/access";
 import { randomToken, sha256 } from "@/lib/crypto";
 import { appUrl } from "@/lib/url";
@@ -16,7 +16,9 @@ export async function createInvitation(opts: {
   clientId: string | null;
   role: ClientRole;
   invitedBy: string | null;
+  agencyStaff?: boolean; // makes the user agency staff; clientId must be null
 }) {
+  if (opts.agencyStaff && opts.clientId) throw new Error("An agency staff invite can't also be for a client");
   const token = randomToken();
   const [invite] = await db
     .insert(invitations)
@@ -24,6 +26,7 @@ export async function createInvitation(opts: {
       email: normalizeEmail(opts.email),
       clientId: opts.clientId,
       role: opts.role,
+      agencyStaff: opts.agencyStaff ?? false,
       invitedBy: opts.invitedBy,
       tokenHash: sha256(token),
       expiresAt: new Date(Date.now() + INVITE_TTL_DAYS * 24 * 60 * 60 * 1000),
@@ -54,6 +57,9 @@ export async function hasPendingInvitation(email: string) {
 }
 
 async function accept(invite: typeof invitations.$inferSelect, userId: string) {
+  if (invite.agencyStaff) {
+    await db.insert(agencyStaff).values({ userId, addedBy: invite.invitedBy }).onConflictDoNothing();
+  }
   if (invite.clientId) {
     await db
       .insert(clientMembers)
@@ -104,6 +110,15 @@ export async function revokeInvitation(opts: { inviteId: string; clientId: strin
       and(eq(invitations.id, opts.inviteId), eq(invitations.clientId, opts.clientId), isNull(invitations.acceptedAt)),
     );
   return "revoked" as const;
+}
+
+// Deletes a pending agency staff invite, so its link stops working.
+export async function revokeStaffInvitation(inviteId: string) {
+  const deleted = await db
+    .delete(invitations)
+    .where(and(eq(invitations.id, inviteId), eq(invitations.agencyStaff, true), isNull(invitations.acceptedAt)))
+    .returning({ id: invitations.id });
+  return deleted.length ? ("revoked" as const) : ("not_found" as const);
 }
 
 // Existing, signed-in user accepting one specific invite link.
