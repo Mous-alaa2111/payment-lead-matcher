@@ -298,7 +298,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                       </td>
                       <td className="px-4 py-2">
                         <span className="block">{m.payerName ?? "—"}</span>
-                        <span className="block text-xs text-zinc-500">
+                        <span className="block text-xs text-zinc-500 dark:text-zinc-400">
                           {[m.payerPhone, m.payerEmail].filter(Boolean).join(" · ") || "no contact details"}
                         </span>
                       </td>
