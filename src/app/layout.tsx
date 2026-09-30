@@ -26,7 +26,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     >
       <body className="min-h-full flex flex-col">
         <header className="px-6 py-4">
-          <Link href="/" className="text-sm font-semibold tracking-tight">
+          <Link href="/" className="text-lg font-bold tracking-tight">
             Elko Creative
           </Link>
         </header>
