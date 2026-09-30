@@ -28,9 +28,18 @@ const MESSAGES: Record<string, string> = {
 };
 
 const STATUS_LABEL = {
-  matched: { text: "Matched", cls: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300" },
-  ambiguous: { text: "Ambiguous", cls: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300" },
-  no_match: { text: "No match", cls: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300" },
+  matched: {
+    text: "Matched",
+    cls: "bg-teal-100 text-teal-900 ring-teal-700/20 dark:bg-teal-950 dark:text-teal-200 dark:ring-teal-400/30",
+  },
+  ambiguous: {
+    text: "Ambiguous",
+    cls: "bg-amber-100 text-amber-900 ring-amber-700/20 dark:bg-amber-950 dark:text-amber-200 dark:ring-amber-400/30",
+  },
+  no_match: {
+    text: "No match",
+    cls: "bg-zinc-100 text-zinc-700 ring-zinc-500/20 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-400/20",
+  },
 } as const;
 
 const PAGE_SIZE = 20;
@@ -122,18 +131,18 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
   return (
     <main className="mx-auto max-w-5xl space-y-8 px-4 py-10">
       <header>
-        <Link href="/dashboard" className="text-sm text-zinc-500 hover:underline">
+        <Link href="/dashboard" className="text-sm text-brand-fg hover:underline">
           ← All clients
         </Link>
         <h1 className="mt-1 text-2xl font-semibold">{client.name}</h1>
         <p className="text-sm text-zinc-500">Your role: {role}</p>
       </header>
 
-      {flash && <p className="rounded-md border px-4 py-2 text-sm">{flash}</p>}
+      {flash && <p className="rounded-md border border-panel-border bg-panel px-4 py-2 text-sm">{flash}</p>}
 
-      <section className="space-y-3">
+      <section className="space-y-3 rounded-xl border border-panel-border bg-panel p-5 shadow-sm">
         <h2 className="font-medium">Payment accounts</h2>
-        <ul className="divide-y rounded-lg border">
+        <ul className="divide-y divide-panel-border rounded-lg border border-panel-border">
           {PROVIDERS.map((p) => {
             const conn = connections.find((c) => c.provider === p.id);
             return (
@@ -174,7 +183,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         </ul>
       </section>
 
-      <section className="space-y-3">
+      <section className="space-y-3 rounded-xl border border-panel-border bg-panel p-5 shadow-sm">
         <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="font-medium">Payments</h2>
@@ -188,15 +197,18 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           {manage && square && (
             <form action={syncAction}>
               <input type="hidden" name="clientId" value={clientId} />
-              <SubmitButton pendingText="Syncing…" className="rounded-md border px-3 py-1.5 text-sm">
+              <SubmitButton
+                pendingText="Syncing…"
+                className="rounded-md border border-transparent bg-brand px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-hover"
+              >
                 Sync now
               </SubmitButton>
             </form>
           )}
         </div>
         {manage && square && (
-          <details open={!!range} className="rounded-lg border px-4 py-3 text-sm">
-            <summary className="cursor-pointer text-zinc-500">Sync a date range</summary>
+          <details open={!!range} className="group rounded-lg border border-panel-border px-4 py-3 text-sm">
+            <summary className="cursor-pointer text-zinc-500 group-open:text-brand-fg">Sync a date range</summary>
             <form
               key={range ? `${range.from}:${range.to}` : "all"}
               action={syncAction}
@@ -240,17 +252,17 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           </p>
         )}
         {range && (
-          <p className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-zinc-100 px-4 py-2 text-sm dark:bg-zinc-800">
+          <p className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-brand-fg/30 bg-brand-soft px-4 py-2 text-sm">
             <span>
               Showing payments from <strong>{range.from}</strong> to <strong>{range.to}</strong> (UTC)
             </span>
-            <Link href={`/dashboard/clients/${clientId}`} scroll={false} className="font-medium underline">
+            <Link href={`/dashboard/clients/${clientId}`} scroll={false} className="font-medium text-brand-fg underline">
               Show all payments
             </Link>
           </p>
         )}
         {matches.length === 0 ? (
-          <p className="rounded-lg border px-4 py-3 text-sm text-zinc-500">
+          <p className="rounded-lg border border-panel-border px-4 py-3 text-sm text-zinc-500">
             {range
               ? "No payments in this date range."
               : square
@@ -291,7 +303,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                         </span>
                       </td>
                       <td className="whitespace-nowrap px-4 py-2">
-                        <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATUS_LABEL[m.status].cls}`}>
+                        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${STATUS_LABEL[m.status].cls}`}>
                           {STATUS_LABEL[m.status].text}
                         </span>
                         {m.method && <span className="block pt-1 text-xs text-zinc-500">by {m.method}</span>}
@@ -337,9 +349,9 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         )}
       </section>
 
-      <section className="space-y-3">
+      <section className="space-y-3 rounded-xl border border-panel-border bg-panel p-5 shadow-sm">
         <h2 className="font-medium">Team</h2>
-        <ul className="divide-y rounded-lg border">
+        <ul className="divide-y divide-panel-border rounded-lg border border-panel-border">
           {members.map((m) => (
             <li key={m.email} className="flex justify-between px-4 py-3 text-sm">
               <span>

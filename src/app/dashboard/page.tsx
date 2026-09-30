@@ -29,12 +29,12 @@ export default async function DashboardPage() {
         {myClients.length === 0 ? (
           <p className="text-sm text-zinc-500">You haven&apos;t been added to any clients yet.</p>
         ) : (
-          <ul className="divide-y rounded-lg border">
+          <ul className="divide-y divide-panel-border rounded-xl border border-panel-border bg-panel shadow-sm">
             {myClients.map((c) => (
               <li key={c.id}>
                 <Link
                   href={`/dashboard/clients/${c.id}`}
-                  className="flex justify-between px-4 py-3 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900"
+                  className="flex justify-between px-4 py-3 text-sm hover:bg-brand-soft"
                 >
                   <span>{c.name}</span>
                   <span className="text-zinc-500">{c.role}</span>

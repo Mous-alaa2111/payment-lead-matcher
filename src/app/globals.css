@@ -3,6 +3,18 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  /* Page: near-white at the top fading into a soft cool-gray glow at the bottom. */
+  --page-gradient:
+    radial-gradient(120% 60% at 50% 115%, rgb(96 125 180 / 0.16), transparent 70%),
+    linear-gradient(180deg, #fbfcfe 0%, #f3f5f9 55%, #e7ebf2 100%);
+  /* Cards floating on the page. */
+  --panel: #ffffff;
+  --panel-border: rgb(30 41 69 / 0.12);
+  /* Muted dark blue accent: fills (brand), hover, and readable text/link color (brand-fg). */
+  --brand: #1f3a68;
+  --brand-hover: #28487f;
+  --brand-fg: #234b8a;
+  --brand-soft: rgb(35 75 138 / 0.08);
   /* Native controls (date picker icon, select dropdowns) follow the page theme. */
   color-scheme: light;
 }
@@ -10,6 +22,12 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-panel: var(--panel);
+  --color-panel-border: var(--panel-border);
+  --color-brand: var(--brand);
+  --color-brand-hover: var(--brand-hover);
+  --color-brand-fg: var(--brand-fg);
+  --color-brand-soft: var(--brand-soft);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -18,14 +36,34 @@
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+    /* Near-black at the top, fading into a dark cool-blue gray glow at the bottom. */
+    --page-gradient:
+      radial-gradient(120% 60% at 50% 115%, rgb(70 92 140 / 0.3), transparent 70%),
+      linear-gradient(180deg, #050608 0%, #090b10 50%, #141821 100%);
+    --panel: #0b0c0f;
+    --panel-border: rgb(148 166 204 / 0.14);
+    --brand: #1f3a68;
+    --brand-hover: #294a82;
+    --brand-fg: #8ea8d8;
+    --brand-soft: rgb(90 125 190 / 0.14);
     color-scheme: dark;
   }
 }
 
 body {
-  background: var(--background);
+  background-color: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* The gradient stays pinned to the viewport while content scrolls (works on iOS, unlike background-attachment: fixed). */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image: var(--page-gradient);
+  pointer-events: none;
 }
 
 /* Tailwind's preflight resets buttons to cursor: default; every interactive button gets a pointer. */
@@ -54,6 +92,10 @@ body {
   }
   input[type="date"]::-webkit-calendar-picker-indicator:hover {
     background-color: rgb(161 161 170 / 0.45);
+  }
+  :focus-visible {
+    outline: 2px solid var(--brand-fg);
+    outline-offset: 2px;
   }
   /* Set by SubmitButton while a request is in flight. */
   [aria-busy="true"],

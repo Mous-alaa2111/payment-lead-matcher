@@ -62,7 +62,7 @@ export default async function InvitePage(props: PageProps<"/invite/[token]">) {
     return (
       <Shell title="Sign in to accept">
         <p>You&apos;ve been invited to <strong>{what}</strong>. You already have an account, so sign in to accept.</p>
-        <Link href={`/sign-in?redirect=/invite/${token}`} className="underline">Sign in</Link>
+        <Link href={`/sign-in?redirect=/invite/${token}`} className="text-brand-fg underline">Sign in</Link>
       </Shell>
     );
   }
@@ -79,8 +79,8 @@ export default async function InvitePage(props: PageProps<"/invite/[token]">) {
 
 function Shell({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <main className="flex min-h-screen items-center justify-center bg-zinc-50 px-4 dark:bg-zinc-950">
-      <div className="w-full max-w-sm space-y-4 rounded-xl border border-zinc-200 bg-white p-6 text-sm shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+    <main className="flex flex-1 items-center justify-center px-4 pb-16">
+      <div className="w-full max-w-sm space-y-4 rounded-xl border border-panel-border bg-panel p-6 text-sm shadow-sm">
         <h1 className="text-xl font-semibold">{title}</h1>
         {children}
       </div>
