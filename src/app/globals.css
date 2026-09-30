@@ -3,6 +3,8 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  /* Native controls (date picker icon, select dropdowns) follow the page theme. */
+  color-scheme: light;
 }
 
 @theme inline {
@@ -16,6 +18,7 @@
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+    color-scheme: dark;
   }
 }
 
@@ -34,6 +37,23 @@ body {
   }
   button:disabled {
     cursor: not-allowed;
+  }
+  /* Dropdown options inherit the page text color; give them the page background too. */
+  select option {
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+  /* Make the date picker's calendar icon easy to spot and click. */
+  input[type="date"]::-webkit-calendar-picker-indicator {
+    cursor: pointer;
+    opacity: 1;
+    padding: 3px;
+    margin-left: 6px;
+    border-radius: 4px;
+    background-color: rgb(161 161 170 / 0.25);
+  }
+  input[type="date"]::-webkit-calendar-picker-indicator:hover {
+    background-color: rgb(161 161 170 / 0.45);
   }
   /* Set by SubmitButton while a request is in flight. */
   [aria-busy="true"],

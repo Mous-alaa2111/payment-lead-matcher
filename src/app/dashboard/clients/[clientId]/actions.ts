@@ -91,11 +91,12 @@ export async function syncAction(form: FormData) {
   let result: string;
   try {
     const s = await syncSquare(clientId, range);
-    result = new URLSearchParams({
-      synced: String(s.payments),
-      from: formatDay(s.window.start),
-      to: formatDay(new Date(s.window.end.getTime() - 1)), // end is exclusive
-    }).toString();
+    // A range sync filters the table to that range (from/to); Sync now shows everything.
+    result = new URLSearchParams(
+      range
+        ? { synced: String(s.payments), from: from.trim(), to: to.trim() }
+        : { synced: String(s.payments), since: formatDay(s.window.start) },
+    ).toString();
   } catch (err) {
     console.error("[sync:square]", err);
     result = "error=sync_failed";

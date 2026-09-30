@@ -1,4 +1,4 @@
-import { and, count, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, count, desc, eq, gt, gte, isNull, lt } from "drizzle-orm";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { db } from "@/db";
@@ -7,7 +7,7 @@ import { canManage, getMembership, isUuid, requireSession } from "@/lib/access";
 import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
-import { formatDay } from "@/lib/sync/window";
+import { formatDay, parseRange } from "@/lib/sync/window";
 import { disconnectAction, revokeInviteAction, syncAction } from "./actions";
 import { SubmitButton } from "@/components/submit-button";
 import { InviteForm } from "./invite-form";
@@ -53,6 +53,16 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
   const { client, role } = membership;
   const manage = canManage(role);
 
+  // ?from=YYYY-MM-DD&to=YYYY-MM-DD (set by a date-range sync) limits the table to those UTC days.
+  const str = (v: string | string[] | undefined) => (typeof v === "string" ? v : "");
+  const parsedRange = search.from || search.to ? parseRange(str(search.from), str(search.to)) : null;
+  const range = parsedRange && !("error" in parsedRange) ? { from: str(search.from), to: str(search.to), ...parsedRange } : null;
+  const inView = and(
+    eq(paymentMatches.clientId, clientId),
+    range ? gte(paymentMatches.paidAt, range.start) : undefined,
+    range ? lt(paymentMatches.paidAt, range.end) : undefined,
+  );
+
   const [connections, members, pendingInvites, statusCounts] = await Promise.all([
     db.select().from(paymentConnections).where(eq(paymentConnections.clientId, clientId)),
     db
@@ -76,13 +86,13 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
     db
       .select({ status: paymentMatches.status, n: count() })
       .from(paymentMatches)
-      .where(eq(paymentMatches.clientId, clientId))
+      .where(inView)
       .groupBy(paymentMatches.status),
   ]);
   const square = connections.find((c) => c.provider === "square");
   const today = formatDay(new Date());
 
-  // Summary counts cover every stored payment; the table shows one page of them.
+  // Summary counts cover every stored payment in view; the table shows one page of them.
   const counts = { matched: 0, ambiguous: 0, no_match: 0 };
   for (const c of statusCounts) counts[c.status] = c.n;
   const total = counts.matched + counts.ambiguous + counts.no_match;
@@ -92,15 +102,19 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
     ? await db
         .select()
         .from(paymentMatches)
-        .where(eq(paymentMatches.clientId, clientId))
+        .where(inView)
         .orderBy(desc(paymentMatches.paidAt), desc(paymentMatches.id))
         .limit(PAGE_SIZE)
         .offset((page - 1) * PAGE_SIZE)
     : [];
-  const pageHref = (n: number) => `/dashboard/clients/${clientId}?page=${n}`;
+  const pageHref = (n: number) =>
+    `/dashboard/clients/${clientId}?${new URLSearchParams({ ...(range && { from: range.from, to: range.to }), page: String(n) })}`;
 
-  const flash = search.synced
-    ? `Sync finished: ${search.synced} payment${search.synced === "1" ? "" : "s"} fetched for ${search.from} to ${search.to} (UTC).`
+  const synced = search.synced && `Sync finished: ${search.synced} payment${search.synced === "1" ? "" : "s"} fetched`;
+  const flash = synced
+    ? range
+      ? `${synced} for ${range.from} to ${range.to} (UTC).`
+      : `${synced}${search.since ? ` since ${search.since}` : ""}.`
     : Object.entries(search)
     .map(([k, v]) => MESSAGES[`${k}=${v}`] ?? (k === "error" ? `Something went wrong (${v}).` : null))
     .find(Boolean);
@@ -181,9 +195,12 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           )}
         </div>
         {manage && square && (
-          <details className="rounded-lg border px-4 py-3 text-sm">
+          <details open={!!range} className="rounded-lg border px-4 py-3 text-sm">
             <summary className="cursor-pointer text-zinc-500">Sync a date range</summary>
-            <form action={syncAction} className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
+            <form
+              key={range ? `${range.from}:${range.to}` : "all"}
+              action={syncAction}
+              className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
               <input type="hidden" name="clientId" value={clientId} />
               <label className="flex flex-col gap-1">
                 <span className="text-zinc-500">From</span>
@@ -191,6 +208,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                   type="date"
                   name="from"
                   required
+                  defaultValue={range?.from}
                   max={today}
                   className="rounded-md border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
                 />
@@ -201,7 +219,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                   type="date"
                   name="to"
                   required
-                  defaultValue={today}
+                  defaultValue={range?.to ?? today}
                   max={today}
                   className="rounded-md border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
                 />
@@ -221,9 +239,23 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
             Last sync failed: {square.lastSyncError}
           </p>
         )}
+        {range && (
+          <p className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-zinc-100 px-4 py-2 text-sm dark:bg-zinc-800">
+            <span>
+              Showing payments from <strong>{range.from}</strong> to <strong>{range.to}</strong> (UTC)
+            </span>
+            <Link href={`/dashboard/clients/${clientId}`} scroll={false} className="font-medium underline">
+              Show all payments
+            </Link>
+          </p>
+        )}
         {matches.length === 0 ? (
           <p className="rounded-lg border px-4 py-3 text-sm text-zinc-500">
-            {square ? "No payments synced yet." : "Connect a payment account to see payments here."}
+            {range
+              ? "No payments in this date range."
+              : square
+                ? "No payments synced yet."
+                : "Connect a payment account to see payments here."}
           </p>
         ) : (
           <>
