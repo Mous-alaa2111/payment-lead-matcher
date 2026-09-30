@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { SubmitButton } from "@/components/submit-button";
 import { signIn, signUp } from "@/lib/auth-client";
 import { INVITE_TOKEN_HEADER } from "@/lib/constants";
 
@@ -70,13 +71,13 @@ export function AuthForm(props: Props) {
 
         {error && <p className="text-sm text-red-600">{error}</p>}
 
-        <button
-          type="submit"
-          disabled={pending}
-          className="w-full rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-zinc-900"
+        <SubmitButton
+          busy={pending}
+          pendingText="Please wait…"
+          className="w-full rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-zinc-900"
         >
-          {pending ? "Please wait…" : isSignUp ? "Create account" : "Sign in"}
-        </button>
+          {isSignUp ? "Create account" : "Sign in"}
+        </SubmitButton>
 
         {!isSignUp && (
           <p className="text-center text-sm text-zinc-500">

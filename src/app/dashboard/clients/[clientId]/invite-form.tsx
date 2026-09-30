@@ -1,6 +1,7 @@
 "use client";
 
 import { useActionState } from "react";
+import { SubmitButton } from "@/components/submit-button";
 import { inviteAction, type InviteState } from "./actions";
 
 export function InviteForm({ clientId, canInviteOwner }: { clientId: string; canInviteOwner: boolean }) {
@@ -26,12 +27,13 @@ export function InviteForm({ clientId, canInviteOwner }: { clientId: string; can
           <option value="admin">Admin</option>
           {canInviteOwner && <option value="owner">Owner</option>}
         </select>
-        <button
-          disabled={pending}
-          className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-zinc-900"
+        <SubmitButton
+          busy={pending}
+          pendingText="Creating…"
+          className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-zinc-900"
         >
-          {pending ? "Creating…" : "Create invite"}
-        </button>
+          Create invite
+        </SubmitButton>
       </div>
       {state.error && <p className="text-sm text-red-600">{state.error}</p>}
       {state.url && (

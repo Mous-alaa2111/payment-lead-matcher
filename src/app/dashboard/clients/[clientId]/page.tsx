@@ -9,6 +9,7 @@ import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
 import { formatDay } from "@/lib/sync/window";
 import { disconnectAction, revokeInviteAction, syncAction } from "./actions";
+import { SubmitButton } from "@/components/submit-button";
 import { InviteForm } from "./invite-form";
 
 // Server Actions on this page (Sync now, date-range backfills) may run long.
@@ -136,18 +137,21 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                     <form action={disconnectAction}>
                       <input type="hidden" name="clientId" value={clientId} />
                       <input type="hidden" name="provider" value={p.id} />
-                      <button className="rounded-md border px-3 py-1.5">Disconnect</button>
+                      <SubmitButton pendingText="Disconnecting…" className="rounded-md border px-3 py-1.5">
+                        Disconnect
+                      </SubmitButton>
                     </form>
                   ) : (
                     <form action={`/api/connect/${p.id}/start`} method="post">
                       <input type="hidden" name="clientId" value={clientId} />
-                      <button
+                      <SubmitButton
                         disabled={!p.configured()}
                         title={p.configured() ? undefined : `${p.name} OAuth isn't configured on the server`}
-                        className="rounded-md bg-zinc-900 px-3 py-1.5 font-medium text-white disabled:opacity-40 dark:bg-white dark:text-zinc-900"
+                        pendingText="Redirecting…"
+                        className="rounded-md bg-zinc-900 px-3 py-1.5 font-medium text-white dark:bg-white dark:text-zinc-900"
                       >
                         Connect {p.name}
-                      </button>
+                      </SubmitButton>
                     </form>
                   ))}
               </li>
@@ -170,7 +174,9 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
           {manage && square && (
             <form action={syncAction}>
               <input type="hidden" name="clientId" value={clientId} />
-              <button className="rounded-md border px-3 py-1.5 text-sm">Sync now</button>
+              <SubmitButton pendingText="Syncing…" className="rounded-md border px-3 py-1.5 text-sm">
+                Sync now
+              </SubmitButton>
             </form>
           )}
         </div>
@@ -200,7 +206,9 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                   className="rounded-md border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
                 />
               </label>
-              <button className="rounded-md border px-3 py-2">Sync range</button>
+              <SubmitButton pendingText="Syncing…" className="rounded-md border px-3 py-2">
+                Sync range
+              </SubmitButton>
             </form>
             <p className="mt-2 text-xs text-zinc-500">
               Dates are UTC and include both days. Use it to backfill a client&apos;s full history or re-sync one
@@ -317,9 +325,9 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                   <form action={revokeInviteAction}>
                     <input type="hidden" name="clientId" value={clientId} />
                     <input type="hidden" name="inviteId" value={i.id} />
-                    <button className="rounded-md border px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800">
+                    <SubmitButton className="rounded-md border px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800">
                       Revoke
-                    </button>
+                    </SubmitButton>
                   </form>
                 )}
               </span>

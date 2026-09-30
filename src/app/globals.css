@@ -24,3 +24,21 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Tailwind's preflight resets buttons to cursor: default; every interactive button gets a pointer. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  input:is([type="submit"], [type="button"], [type="reset"]):not(:disabled) {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
+  }
+  /* Set by SubmitButton while a request is in flight. */
+  [aria-busy="true"],
+  html[data-busy],
+  html[data-busy] * {
+    cursor: progress !important;
+  }
+}

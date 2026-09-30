@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { AuthForm } from "@/app/(auth)/auth-form";
+import { SubmitButton } from "@/components/submit-button";
 import { db } from "@/db";
 import { clients, user } from "@/db/schema";
 import { getSession } from "@/lib/access";
@@ -48,9 +49,9 @@ export default async function InvitePage(props: PageProps<"/invite/[token]">) {
       <Shell title="Accept invite">
         <p>You&apos;ve been invited to <strong>{what}</strong>.</p>
         <form action={accept}>
-          <button className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-zinc-900">
+          <SubmitButton pendingText="Accepting…" className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-zinc-900">
             Accept
-          </button>
+          </SubmitButton>
         </form>
       </Shell>
     );
