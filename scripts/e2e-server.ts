@@ -16,6 +16,7 @@ const env = {
   STRIPE_SECRET_KEY: "sk_test_e2e_fake",
   SQUARE_APPLICATION_ID: "",
   SQUARE_APPLICATION_SECRET: "",
+  CRON_SECRET: "e2e-cron-secret", // E2E_CRON_SECRET in scripts/e2e.ts
 };
 for (const cmd of ["npx next build", "npx next start"]) {
   const r = spawnSync(cmd, { stdio: "inherit", shell: true, env });

@@ -26,6 +26,11 @@ export const clients = pgTable("clients", {
   slug: text("slug").notNull().unique(),
   ghlLocationId: text("ghl_location_id").unique(),
   ghlTokenEnc: text("ghl_token_enc"), // location Private Integration Token, encrypted (lib/crypto)
+  // Daily auto sync (lib/sync/auto). Set when a run starts on this client, so a client that
+  // times out goes to the back of the queue. Per-provider errors live on payment_connections
+  // as for Sync now; this holds only a failure outside them.
+  lastAutoSyncAt: timestamp("last_auto_sync_at", { withTimezone: true }),
+  lastAutoSyncError: text("last_auto_sync_error"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .defaultNow()

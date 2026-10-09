@@ -9,6 +9,7 @@ import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
 import { PROVIDER_NAME } from "@/lib/sync";
+import { autoSyncBlocker, nextAutoSync } from "@/lib/sync/schedule";
 import { formatDay, parseRange } from "@/lib/sync/window";
 import { disconnectAction, revokeInviteAction, syncAction, syncRangeAction } from "./actions";
 import { SubmitButton } from "@/components/submit-button";
@@ -107,6 +108,9 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
   const syncedNames = synced.map((c) => PROVIDER_NAME[c.provider]).join(" and ");
   const utc = (d: Date) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
   const today = formatDay(new Date());
+  // Daily auto sync (lib/sync/auto): same sync as Sync now, run by Vercel Cron.
+  const autoBlocker = autoSyncBlocker(client, connections);
+  const autoNext = autoBlocker ? null : nextAutoSync(connections);
 
   // Summary counts cover every stored payment in view; the table shows one page of them.
   const counts = { matched: 0, ambiguous: 0, no_match: 0 };
@@ -229,6 +233,10 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
                 {c.syncedThrough && ` · payments synced through ${formatDay(c.syncedThrough)}`}
               </p>
             ))}
+            <p className="text-sm text-zinc-500">
+              Last auto sync: {client.lastAutoSyncAt ? utc(client.lastAutoSyncAt) : "never"} · Next auto sync:{" "}
+              {autoNext ? `${formatDay(autoNext)}, around ${utc(autoNext).slice(11)}` : `off (${autoBlocker})`}
+            </p>
           </div>
           {manage && canSync && (
             <form action={syncAction}>
@@ -304,6 +312,11 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
               Last {PROVIDER_NAME[c.provider]} sync failed: {c.lastSyncError}
             </p>
           ))}
+        {client.lastAutoSyncError && (
+          <p className="rounded-md border border-red-300 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:text-red-400">
+            Last auto sync failed: {client.lastAutoSyncError}
+          </p>
+        )}
         {range && (
           <p className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-brand-fg/30 bg-brand-soft px-4 py-2 text-sm">
             <span>

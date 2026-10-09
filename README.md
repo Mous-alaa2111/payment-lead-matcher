@@ -69,6 +69,14 @@ account is read with `STRIPE_SECRET_KEY` + `Stripe-Account`; to test before Conn
 as that client's connection (the e2e branch has one on Essential Auto Werks, the location
 stripe-crm-sync's Stripe fixtures were built against).
 
+**Auto sync.** Vercel Cron (`vercel.json`, daily at 06:00 UTC, within the hour on Hobby)
+calls `GET /api/cron/auto-sync` with `Authorization: Bearer $CRON_SECRET` (set on Vercel
+Production; anything else gets 401). It runs the same incremental sync as Sync now on every
+client with a GHL token and a connected account whose oldest last successful sync is
+`AUTO_SYNC_EVERY_DAYS` (14, `src/lib/sync/schedule.ts`) or more UTC days old, one client at a
+time, least recently auto-synced first. No new client starts after 200 s; the rest wait for
+the next day. Errors show on the client page like Sync now's.
+
 
 ## End-to-end tests (separate Neon branch)
 

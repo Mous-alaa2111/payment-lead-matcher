@@ -286,6 +286,137 @@ async function stripeSyncChecks(tag: string, owner: Jar, ownerId: string) {
   }
 }
 
+// Must match CRON_SECRET in scripts/e2e-server.ts.
+const E2E_CRON_SECRET = "e2e-cron-secret";
+
+// Daily auto sync. The route's auth is checked over HTTP; the runner itself runs
+// in-process (limited to this run's clients) with Stripe, Square and GHL faked,
+// so no other client on the e2e branch is synced.
+async function autoSyncChecks(tag: string, owner: Jar, ownerId: string) {
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("../src/db");
+  const { clients, clientMembers, paymentConnections, paymentMatches } = await import("../src/db/schema");
+  const { encrypt } = await import("../src/lib/crypto");
+  const { runAutoSync } = await import("../src/lib/sync/auto");
+  const { AUTO_SYNC_EVERY_DAYS } = await import("../src/lib/sync/schedule");
+  const { formatDay } = await import("../src/lib/sync/window");
+
+  const cron = (headers: Record<string, string> = {}) => fetch(`${BASE}/api/cron/auto-sync`, { headers });
+  let res = await cron();
+  check("cron route rejects a request with no secret", res.status === 401, `status ${res.status}`);
+  res = await cron({ Authorization: "Bearer wrong-secret" });
+  check("cron route rejects a wrong secret", res.status === 401, `status ${res.status}`);
+  res = await cron({ Authorization: E2E_CRON_SECRET });
+  check("cron route rejects the secret without 'Bearer '", res.status === 401, `status ${res.status}`);
+  res = await cron({ Authorization: "Bearer " });
+  check("cron route rejects an empty bearer token", res.status === 401, `status ${res.status}`);
+  res = await fetch(`${BASE}/api/cron/auto-sync`, { method: "POST", headers: { Authorization: `Bearer ${E2E_CRON_SECRET}` } });
+  check("cron route doesn't accept POST", res.status === 405, `status ${res.status}`);
+
+  const DAY = 86_400_000;
+  const ago = (d: number) => new Date(Date.now() - d * DAY);
+  const stripeCalls: URL[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const json = (b: object) => new Response(JSON.stringify(b), { status: 200 });
+    if (url.hostname === "api.stripe.com" && url.pathname === "/v1/charges") {
+      stripeCalls.push(url);
+      return json({
+        data: [{ id: "ch_auto", created: Math.floor(ago(1).getTime() / 1000), amount: 900, currency: "usd", status: "succeeded",
+          customer: null, billing_details: { email: "auto@example.com" } }],
+        has_more: false,
+      });
+    }
+    if (url.hostname === "services.leadconnectorhq.com") return json({ contacts: [{ id: "g-auto", firstName: "Auto", email: "auto@example.com" }], meta: {} });
+    return realFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    const make = async (key: string, ghl: boolean, lastAutoSyncAt: Date | null) => {
+      const [c] = await db
+        .insert(clients)
+        .values({
+          name: `E2E auto ${key} ${tag}`, slug: `${tag}-auto-${key}`, lastAutoSyncAt,
+          ...(ghl ? { ghlLocationId: `${tag}-auto-${key}`, ghlTokenEnc: encrypt("fake-pit") } : {}),
+        })
+        .returning();
+      await db.insert(clientMembers).values({ clientId: c.id, userId: ownerId, role: "owner" });
+      return c;
+    };
+    const stripeConn = (clientId: string, lastSyncedAt: Date | null) => ({
+      clientId, provider: "stripe" as const, externalAccountId: `acct_${clientId.slice(0, 8)}`, accessTokenEnc: encrypt("sk_test_fake"),
+      livemode: false, scope: "manual-seed", lastSyncedAt, syncedThrough: lastSyncedAt,
+    });
+    const monthAgo = ago(30);
+    const due = await make("due", true, monthAgo); // last synced 20 days ago, auto-synced a month ago
+    const failing = await make("failing", true, null); // never auto-synced, so it goes first; Square has no token
+    const fresh = await make("fresh", true, null); // synced 2 days ago: not due
+    const noGhl = await make("noghl", false, null); // old sync but no GHL token: not eligible
+    const noConn = await make("noconn", true, null); // GHL but nothing connected: not eligible
+    await db.insert(paymentConnections).values([
+      stripeConn(due.id, ago(20)),
+      { clientId: failing.id, provider: "square", externalAccountId: `${tag}-auto-sq`, livemode: false, lastSyncedAt: ago(40) },
+      stripeConn(fresh.id, ago(2)),
+      stripeConn(noGhl.id, ago(40)),
+    ]);
+    const ours = [due, failing, fresh, noGhl, noConn].map((c) => c.id);
+    const get = async (id: string) => (await db.select().from(clients).where(eq(clients.id, id)))[0];
+    const connOf = async (id: string) => (await db.select().from(paymentConnections).where(eq(paymentConnections.clientId, id)))[0];
+
+    // Out of time before the first client: nothing starts, everything due is left for the next run.
+    let report = await runAutoSync({ onlyClientIds: ours, stopStartingAfterMs: -1 });
+    check("auto sync picks only clients with a GHL token, a connected account and a 14+ day old sync",
+      report.eligible === 3 && report.due === 2, `eligible ${report.eligible}, due ${report.due}`);
+    check("out of time: no client is started, the rest are reported as remaining",
+      report.synced.length === 0 && report.remaining === 2 && stripeCalls.length === 0 &&
+        (await get(due.id)).lastAutoSyncAt?.getTime() === monthAgo.getTime() && !(await get(failing.id)).lastAutoSyncAt);
+
+    const dueBefore = await connOf(due.id);
+    report = await runAutoSync({ onlyClientIds: ours });
+    check("next run picks up the remaining clients, least recently auto-synced first",
+      report.remaining === 0 && report.synced.map((s) => s.client).join("|") === [failing.name, due.name].join("|"), JSON.stringify(report.synced));
+    const failed = report.synced.find((s) => s.client === failing.name);
+    const ok = report.synced.find((s) => s.client === due.name);
+    check("a failing client is reported and doesn't stop the next one",
+      failed?.ok === false && failed.errors.length === 1 && ok?.ok === true, JSON.stringify(report.synced));
+    check("auto sync is Sync now's incremental window (synced_through minus 7 days)",
+      stripeCalls.length === 1 &&
+        stripeCalls[0].searchParams.get("created[gte]") === String(Math.floor((dueBefore.syncedThrough!.getTime() - 7 * DAY) / 1000)),
+      stripeCalls.map((u) => u.search).join(" "));
+    const dueAfter = await connOf(due.id);
+    check("auto sync stores payments and moves last synced / synced through",
+      (await db.select().from(paymentMatches).where(eq(paymentMatches.clientId, due.id))).length === 1 &&
+        dueAfter.lastSyncedAt!.getTime() > Date.now() - 60_000 && dueAfter.syncedThrough!.getTime() > Date.now() - 60_000 && !dueAfter.lastSyncError);
+    const failingConn = await connOf(failing.id);
+    check("the failure is recorded on that client's connection, as Sync now does",
+      Boolean(failingConn.lastSyncError) && failingConn.lastSyncedAt!.getTime() < Date.now() - 39 * DAY);
+    const [dueRow, failingRow, freshRow] = await Promise.all([get(due.id), get(failing.id), get(fresh.id)]);
+    check("last auto sync is set on the clients it ran, not on the others",
+      dueRow.lastAutoSyncAt!.getTime() > Date.now() - 60_000 && Boolean(failingRow.lastAutoSyncAt) && !freshRow.lastAutoSyncAt);
+
+    report = await runAutoSync({ onlyClientIds: ours });
+    check("a client synced today isn't due again; a still-failing one is retried",
+      report.synced.map((s) => s.client).join("|") === failing.name, JSON.stringify(report.synced));
+
+    const page = async (id: string) => (await (await owner.fetch(`/dashboard/clients/${id}`)).text()).replace(/<!-- -->/g, "");
+    const nextDay = formatDay(new Date(Math.floor(Date.now() / DAY) * DAY + AUTO_SYNC_EVERY_DAYS * DAY));
+    let html = await page(due.id);
+    check("client page shows Last auto sync and Next auto sync (14 days on, around 06:00 UTC)",
+      html.includes(`Last auto sync: ${formatDay(dueRow.lastAutoSyncAt!)}`) && html.includes(`Next auto sync: ${nextDay}, around 06:00 UTC`),
+      html.match(/Last auto sync[^<]*/)?.[0]);
+    html = await page(failing.id);
+    check("a failed auto sync shows its error like Sync now", html.includes("Last Square sync failed:") && html.includes("Next auto sync: "));
+    check("never auto-synced client shows 'never'", (await page(fresh.id)).includes("Last auto sync: never"));
+    check("no GHL token: auto sync shown as off", (await page(noGhl.id)).includes("Next auto sync: off (add a GHL token"));
+    check("nothing connected: auto sync shown as off", (await page(noConn.id)).includes("Next auto sync: off (connect Stripe or Square"));
+    await db.update(clients).set({ lastAutoSyncError: "boom outside the providers" }).where(eq(clients.id, fresh.id));
+    check("a client-level auto sync error is shown", (await page(fresh.id)).includes("Last auto sync failed: boom outside the providers"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 async function main() {
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
@@ -575,6 +706,9 @@ async function main() {
     // --- Stripe sync (real sync code; Stripe + GHL faked in-process) ---
     await stripeSyncChecks(tag, owner, ownerRow.id);
 
+    // --- Daily auto sync: cron route auth, runner (faked providers), client page ---
+    await autoSyncChecks(tag, owner, ownerRow.id);
+
     // --- Remove client: agency staff only, behind a dialog; cascades to everything stored for it ---
     const [doomed] = await db.insert(clients).values({ name: `E2E remove ${tag}`, slug: `${tag}-remove` }).returning();
     await db.insert(clientMembers).values({ clientId: doomed.id, userId: ownerRow.id, role: "owner" });
@@ -616,6 +750,7 @@ async function main() {
     await db.delete(clients).where(
       inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`, `${tag}-stripe`, `${tag}-remove`]),
     );
+    await db.delete(clients).where(like(clients.slug, `${tag}-auto-%`));
   }
 
   // Encryption round trip
