@@ -419,10 +419,13 @@ async function autoSyncChecks(tag: string, owner: Jar, ownerId: string) {
 
 // Client Health. The page and status control are checked over HTTP; the refresh
 // runner runs in-process (limited to this run's clients) with GHL faked.
-async function healthChecks(tag: string, owner: Jar, staff: Jar, formFields: (html: string, marker: string) => FormData) {
+// clientUsers (owner, admin, viewer) are made members of the health test client,
+// so "refused" is checked for users who can otherwise see that client.
+type ClientUser = { role: "owner" | "admin" | "viewer"; jar: Jar; userId: string };
+async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, formFields: (html: string, marker: string) => FormData) {
   const { and, eq, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
-  const { clients, clientHealthStatus, clientHealthWeeks } = await import("../src/db/schema");
+  const { clients, clientHealthStatus, clientHealthWeeks, clientMembers } = await import("../src/db/schema");
   const { encrypt } = await import("../src/lib/crypto");
   const { refreshClientHealth } = await import("../src/lib/health/refresh");
   const { isoDay, weekStart } = await import("../src/lib/health/rules");
@@ -478,12 +481,17 @@ async function healthChecks(tag: string, owner: Jar, staff: Jar, formFields: (ht
     const denied = await make("denied", true);
     const noToken = await make("notoken", false);
     const ours = [good.id, denied.id, noToken.id];
+    await db.insert(clientMembers).values(clientUsers.map((u) => ({ clientId: good.id, userId: u.userId, role: u.role })));
 
-    let r = await owner.fetch("/dashboard/health");
-    check("Client Health page is refused to non-staff", r.status !== 200 && !(await r.text()).includes("Refresh now"), `status ${r.status}`);
-    const ownerDash = await (await owner.fetch("/dashboard")).text();
+    let r: Response;
+    for (const { role, jar } of clientUsers) {
+      r = await jar.fetch("/dashboard/health");
+      check(`Client Health page is refused to a client ${role}`, r.status !== 200 && !(await r.text()).includes("Refresh now"), `status ${r.status}`);
+      const dash = await (await jar.fetch("/dashboard")).text();
+      check(`a client ${role}'s dashboard has no Client Health link`, dash.includes("Your clients") && !dash.includes("/dashboard/health"));
+    }
     const staffDash = await (await staff.fetch("/dashboard")).text();
-    check("only staff get the Client Health link", !ownerDash.includes("/dashboard/health") && staffDash.includes("/dashboard/health"));
+    check("staff get the Client Health link", staffDash.includes("/dashboard/health"));
 
     let report = await refreshClientHealth({ onlyClientIds: ours });
     const byName = (n: string) => report.find((x) => x.client === n);
@@ -538,13 +546,21 @@ async function healthChecks(tag: string, owner: Jar, staff: Jar, formFields: (ht
     // Client status: staff set it on the client page; the health page filters by it.
     const clientPage = (await (await staff.fetch(`/dashboard/clients/${good.id}`)).text()).replace(/<!-- -->/g, "");
     check("staff see the client status control", clientPage.includes('name="status"') && clientPage.includes("Client status"));
-    const ownerClientPage = await (await owner.fetch(`/dashboard/clients/${good.id}`)).text();
-    check("non-staff don't see the client status control", !ownerClientPage.includes("Client status"));
     const statusForm = formFields(clientPage, "Client status");
     const statusOf = async () => (await db.select({ s: clients.status }).from(clients).where(eq(clients.id, good.id)))[0].s;
-    statusForm.set("status", "paused");
-    await owner.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
-    check("new clients start Active; non-staff can't change status (replayed action refused)", (await statusOf()) === "active");
+    check("new clients start Active", (await statusOf()) === "active");
+    for (const { role, jar } of clientUsers) {
+      r = await jar.fetch(`/dashboard/clients/${good.id}`);
+      const own = (await r.text()).replace(/<!-- -->/g, "");
+      check(`a client ${role} opens their own client page but sees no status picker or status label`,
+        r.status === 200 && own.includes(good.name) && !own.includes("Client status") && !own.includes('name="status"') &&
+          !/>(Active|Onboarding|Paused|Canceled)</.test(own), `status ${r.status}`);
+      // Hand-built: staff's status form (action id, bound client id) replayed with this user's cookies.
+      statusForm.set("status", "canceled");
+      r = await jar.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
+      check(`a client ${role} can't change status (replayed action refused)`,
+        (await statusOf()) === "active" && !(r.headers.get("location") ?? "").includes("status=saved"), `status ${r.status}`);
+    }
     statusForm.set("status", "bogus");
     await staff.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
     check("an unknown status is refused", (await statusOf()) === "active");
@@ -560,10 +576,19 @@ async function healthChecks(tag: string, owner: Jar, staff: Jar, formFields: (ht
     await db.update(clients).set({ status: "onboarding" }).where(eq(clients.id, good.id));
     check("onboarding clients are in the default view", (await page()).includes(`data-client="${good.id}"`));
 
+    // Hand-built: staff's Refresh now form replayed with each client user's cookies. Had it
+    // run, it would refresh every client with a token, good included (GHL isn't faked in the
+    // server), moving good's last refresh time.
     const refreshForm = formFields(html, "Refresh now");
-    r = await owner.fetch("/dashboard/health", { method: "POST", body: refreshForm });
-    check("non-staff can't run Refresh now (replayed action refused)",
-      !(r.headers.get("location") ?? "").includes("refreshed="), `status ${r.status}`);
+    const lastRefresh = async () =>
+      (await db.select().from(clientHealthStatus).where(eq(clientHealthStatus.clientId, good.id)))[0]?.lastRefreshedAt.getTime();
+    const before = await lastRefresh();
+    for (const { role, jar } of clientUsers) {
+      r = await jar.fetch("/dashboard/health", { method: "POST", body: refreshForm });
+      check(`a client ${role} can't run Refresh now (replayed action refused)`,
+        r.status !== 303 && !(r.headers.get("location") ?? "").includes("refreshed=") && (await lastRefresh()) === before,
+        `status ${r.status}`);
+    }
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -862,7 +887,13 @@ async function main() {
     await autoSyncChecks(tag, owner, ownerRow.id);
 
     // --- Client Health: staff-only page, refresh runner (GHL faked), client status ---
-    await healthChecks(tag, owner, staff, formFields);
+    const [adminRow] = await db.select().from(user).where(eq(user.email, adminEmail));
+    const [viewerRow] = await db.select().from(user).where(eq(user.email, viewerEmail));
+    await healthChecks(tag, [
+      { role: "owner", jar: owner, userId: ownerRow.id },
+      { role: "admin", jar: admin, userId: adminRow.id },
+      { role: "viewer", jar: viewer, userId: viewerRow.id },
+    ], staff, formFields);
 
     // --- Remove client: agency staff only, behind a dialog; cascades to everything stored for it ---
     const [doomed] = await db.insert(clients).values({ name: `E2E remove ${tag}`, slug: `${tag}-remove` }).returning();
