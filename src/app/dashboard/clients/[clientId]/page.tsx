@@ -11,7 +11,8 @@ import { canManageInviteRole } from "@/lib/invitations";
 import { PROVIDER_NAME } from "@/lib/sync";
 import { autoSyncBlocker, nextAutoSync } from "@/lib/sync/schedule";
 import { formatDay, parseRange } from "@/lib/sync/window";
-import { disconnectAction, revokeInviteAction, syncAction, syncRangeAction } from "./actions";
+import { CLIENT_STATUSES, CLIENT_STATUS_LABEL } from "@/lib/client-status";
+import { disconnectAction, revokeInviteAction, setClientStatusAction, syncAction, syncRangeAction } from "./actions";
 import { SubmitButton } from "@/components/submit-button";
 import { InviteForm } from "./invite-form";
 import { RemoveClient } from "./remove-client";
@@ -29,6 +30,7 @@ const MESSAGES: Record<string, string> = {
   "error=square_exchange_failed": "Square didn't accept the connection. Please try again.",
   "error=bad_range": "Pick a start and end date, with the start on or before the end.",
   "error=sync_failed": "Sync failed. The error is shown under Payments.",
+  "status=saved": "Client status saved.",
 };
 
 const STATUS_LABEL = {
@@ -175,6 +177,28 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         </Link>
         <h1 className="mt-1 text-2xl font-semibold">{client.name}</h1>
         <p className="text-sm text-zinc-500">Your role: {membership.agency ? "agency staff" : role}</p>
+        {membership.agency && (
+          <form action={setClientStatusAction.bind(null, clientId)} className="mt-3 flex items-center gap-2 text-sm">
+            <label htmlFor="client-status" className="text-zinc-500">
+              Client status
+            </label>
+            <select
+              id="client-status"
+              name="status"
+              defaultValue={client.status}
+              className="rounded-md border border-zinc-300 bg-transparent px-2 py-1.5 dark:border-zinc-700"
+            >
+              {CLIENT_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {CLIENT_STATUS_LABEL[s]}
+                </option>
+              ))}
+            </select>
+            <SubmitButton pendingText="Saving…" className="rounded-md border px-3 py-1.5">
+              Save
+            </SubmitButton>
+          </form>
+        )}
       </header>
 
       {flash && <p className="rounded-md border border-panel-border bg-panel px-4 py-2 text-sm">{flash}</p>}

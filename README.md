@@ -77,6 +77,20 @@ client with a GHL token and a connected account whose oldest last successful syn
 time, least recently auto-synced first. No new client starts after 200 s; the rest wait for
 the next day. Errors show on the client page like Sync now's.
 
+## Client Health (agency staff)
+
+`/dashboard/health` ports the GHL CLI's `health_tracker.py` / `weekly_report.py` rules
+unchanged (`src/lib/health/rules.ts`, unit-tested): per client and Monday-to-Sunday UTC week,
+opportunities created and how many are now in a booked/scheduled stage; Red at 2+ weeks with
+none, Yellow if none this week, trend Down or under 20% booked. Refresh now reads each
+client's GHL opportunities with its stored token, 3 clients at a time, into
+`client_health_weeks`; a client's first refresh backfills 8 weeks, and a week fetched after it
+ended is never fetched again. Errors (e.g. a token without opportunities access) are stored
+per client in `client_health_status` and shown grey, never red; so is a client with no token.
+
+Each client has a status (Active, Onboarding, Paused, Canceled), set by staff on the client
+page; the health page shows Active and Onboarding by default. The starting statuses were set
+once with `npm run set:client-statuses -- --apply --production` (dry run without the flags).
 
 ## End-to-end tests (separate Neon branch)
 

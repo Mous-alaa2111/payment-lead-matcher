@@ -417,6 +417,158 @@ async function autoSyncChecks(tag: string, owner: Jar, ownerId: string) {
   }
 }
 
+// Client Health. The page and status control are checked over HTTP; the refresh
+// runner runs in-process (limited to this run's clients) with GHL faked.
+async function healthChecks(tag: string, owner: Jar, staff: Jar, formFields: (html: string, marker: string) => FormData) {
+  const { and, eq, inArray } = await import("drizzle-orm");
+  const { db } = await import("../src/db");
+  const { clients, clientHealthStatus, clientHealthWeeks } = await import("../src/db/schema");
+  const { encrypt } = await import("../src/lib/crypto");
+  const { refreshClientHealth } = await import("../src/lib/health/refresh");
+  const { isoDay, weekStart } = await import("../src/lib/health/rules");
+
+  const DAY = 86_400_000;
+  const thisMonday = weekStart(new Date()).getTime();
+  const mondayOf = (n: number) => isoDay(new Date(thisMonday - n * 7 * DAY)); // n weeks back
+  // createdAt n weeks before this week's Monday, plus `h` hours (never in the future).
+  const inWeek = (n: number, h = 1) =>
+    new Date(Math.min(thisMonday - n * 7 * DAY + h * 3_600_000, Date.now() - 60_000)).toISOString();
+  const opps = [
+    { createdAt: inWeek(0, 3), pipelineStageId: "s-booked", status: "won", monetaryValue: 100 },
+    { createdAt: inWeek(0, 2), pipelineStageId: "s-booked", status: "open" },
+    { createdAt: inWeek(0, 1), pipelineStageId: "s-new", status: "open" },
+    { createdAt: inWeek(1, 5), pipelineStageId: "s-not", status: "lost" },
+    { createdAt: inWeek(1, 4), pipelineStageId: "s-new", status: "open" },
+    { createdAt: inWeek(3, 1), pipelineStageId: "s-booked", status: "open" },
+    { createdAt: inWeek(12, 1), pipelineStageId: "s-booked", status: "open" }, // before the 8-week backfill
+  ];
+  const searches: URL[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.hostname !== "services.leadconnectorhq.com") return realFetch(input, init);
+    const loc = url.searchParams.get("locationId") ?? url.searchParams.get("location_id");
+    if (loc === `${tag}-h-denied`) return new Response('{"message":"The token is not authorized for this scope."}', { status: 403 });
+    if (url.pathname === "/opportunities/pipelines") {
+      return Response.json({
+        pipelines: [{ stages: [
+          { id: "s-booked", name: "Appointment Booked" }, { id: "s-new", name: "New Lead" }, { id: "s-not", name: "Not Scheduled" },
+        ] }],
+      });
+    }
+    if (url.pathname === "/opportunities/search") {
+      searches.push(url);
+      return Response.json({ opportunities: opps, meta: { total: opps.length } });
+    }
+    return new Response("unexpected", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const make = async (key: string, ghl: boolean) =>
+      (
+        await db
+          .insert(clients)
+          .values({
+            name: `E2E health ${key} ${tag}`, slug: `${tag}-health-${key}`,
+            ...(ghl ? { ghlLocationId: `${tag}-h-${key}`, ghlTokenEnc: encrypt("fake-pit") } : {}),
+          })
+          .returning()
+      )[0];
+    const good = await make("good", true);
+    const denied = await make("denied", true);
+    const noToken = await make("notoken", false);
+    const ours = [good.id, denied.id, noToken.id];
+
+    let r = await owner.fetch("/dashboard/health");
+    check("Client Health page is refused to non-staff", r.status !== 200 && !(await r.text()).includes("Refresh now"), `status ${r.status}`);
+    const ownerDash = await (await owner.fetch("/dashboard")).text();
+    const staffDash = await (await staff.fetch("/dashboard")).text();
+    check("only staff get the Client Health link", !ownerDash.includes("/dashboard/health") && staffDash.includes("/dashboard/health"));
+
+    let report = await refreshClientHealth({ onlyClientIds: ours });
+    const byName = (n: string) => report.find((x) => x.client === n);
+    check("first refresh backfills 8 weeks; a client with no GHL token is left out",
+      byName(good.name)?.ok === true && byName(good.name)?.weeks === 8 && !byName(noToken.name) && report.length === 2, JSON.stringify(report));
+    check("a 403 on opportunities is recorded on that client and doesn't stop the rest",
+      byName(denied.name)?.ok === false && /refused the token \(403\)/.test(byName(denied.name)?.error ?? ""), byName(denied.name)?.error);
+    check("opportunities are read with location_id and paged like the Python",
+      searches.length === 1 && searches[0].searchParams.get("location_id") === `${tag}-h-good` && searches[0].searchParams.get("page") === "1");
+
+    const weeks = await db.select().from(clientHealthWeeks).where(eq(clientHealthWeeks.clientId, good.id));
+    const week = (n: number) => weeks.find((w) => w.weekStart === mondayOf(n));
+    check("one row per week, zeros included", weeks.length === 8 && week(2)?.total === 0 && week(7)?.total === 0, `${weeks.length} rows`);
+    check("this week: total, booked, won and revenue by current stage",
+      week(0)?.total === 3 && week(0)?.booked === 2 && week(0)?.won === 1 && week(0)?.revenueCents === 10000 && week(0)?.lost === 0,
+      JSON.stringify(week(0)));
+    check("last week: 'Not Scheduled' isn't booked; lost counted", week(1)?.total === 2 && week(1)?.booked === 0 && week(1)?.lost === 1);
+    check("older weeks come from the backfill", week(3)?.total === 1 && week(3)?.booked === 1);
+    const [deniedStatus] = await db.select().from(clientHealthStatus).where(eq(clientHealthStatus.clientId, denied.id));
+    const deniedWeeks = await db.select().from(clientHealthWeeks).where(eq(clientHealthWeeks.clientId, denied.id));
+    check("the failed client has its error stored and no weeks", Boolean(deniedStatus?.lastError) && deniedWeeks.length === 0);
+
+    report = await refreshClientHealth({ onlyClientIds: [good.id] });
+    check("next refresh fetches only this week (finished weeks are frozen)", report[0]?.weeks === 1, JSON.stringify(report));
+    const after = await db.select().from(clientHealthWeeks).where(eq(clientHealthWeeks.clientId, good.id));
+    check("frozen weeks keep their first fetch",
+      after
+        .filter((w) => w.weekStart !== mondayOf(0))
+        .every((w) => w.fetchedAt.getTime() === weeks.find((x) => x.weekStart === w.weekStart)!.fetchedAt.getTime()));
+
+    const page = async (q = "") => (await (await staff.fetch(`/dashboard/health${q}`)).text()).replace(/<!-- -->/g, "");
+    const row = (html: string, id: string) => html.split(`data-client="${id}"`)[1]?.split("</tr>")[0] ?? "";
+    const cells = (html: string) => [...html.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map((m) => m[1].replace(/<[^>]+>/g, "|"));
+    let html = await page();
+    // This week 3 vs last week 2: Up; 2 of 3 booked = 67%; active this week.
+    const g = cells(row(html, good.id));
+    check("staff see the client's health: Green, 3 vs 2, Up, 67%, 0 weeks",
+      g[1]?.includes("Green") && g[2] === "3" && g[3] === "2" && g[4] === "Up" && g[5] === "67%" && g[6] === "0", JSON.stringify(g));
+    const d = row(html, denied.id);
+    check("a 403 client shows its error, grey, never red", d.includes("Refresh failed") && d.includes("refused the token (403)") && !d.includes(">Red<"));
+    const n = cells(row(html, noToken.id));
+    check("a client with no GHL token shows grey 'No GHL token', no zeros",
+      n[1]?.includes("No GHL token") && n.slice(2).every((c) => !/\b0\b/.test(c)) && !n[1]?.includes("Red"), JSON.stringify(n));
+
+    // Two weeks in a row with no activity: red.
+    await db
+      .update(clientHealthWeeks)
+      .set({ total: 0, booked: 0 })
+      .where(and(eq(clientHealthWeeks.clientId, good.id), inArray(clientHealthWeeks.weekStart, [mondayOf(0), mondayOf(1)])));
+    check("two weeks with no activity: Red", cells(row(await page(), good.id))[1]?.includes("Red"));
+
+    // Client status: staff set it on the client page; the health page filters by it.
+    const clientPage = (await (await staff.fetch(`/dashboard/clients/${good.id}`)).text()).replace(/<!-- -->/g, "");
+    check("staff see the client status control", clientPage.includes('name="status"') && clientPage.includes("Client status"));
+    const ownerClientPage = await (await owner.fetch(`/dashboard/clients/${good.id}`)).text();
+    check("non-staff don't see the client status control", !ownerClientPage.includes("Client status"));
+    const statusForm = formFields(clientPage, "Client status");
+    const statusOf = async () => (await db.select({ s: clients.status }).from(clients).where(eq(clients.id, good.id)))[0].s;
+    statusForm.set("status", "paused");
+    await owner.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
+    check("new clients start Active; non-staff can't change status (replayed action refused)", (await statusOf()) === "active");
+    statusForm.set("status", "bogus");
+    await staff.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
+    check("an unknown status is refused", (await statusOf()) === "active");
+    statusForm.set("status", "paused");
+    r = await staff.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
+    check("staff set a client to Paused", (await statusOf()) === "paused", `status ${r.status}`);
+    html = await page();
+    check("health page shows Active and Onboarding by default",
+      !html.includes(`data-client="${good.id}"`) && html.includes(`data-client="${denied.id}"`));
+    check("the Paused filter shows paused clients only",
+      (await page("?show=paused")).includes(`data-client="${good.id}"`) && !(await page("?show=paused")).includes(`data-client="${denied.id}"`));
+    check("the All filter shows everyone", (await page("?show=all")).includes(`data-client="${good.id}"`));
+    await db.update(clients).set({ status: "onboarding" }).where(eq(clients.id, good.id));
+    check("onboarding clients are in the default view", (await page()).includes(`data-client="${good.id}"`));
+
+    const refreshForm = formFields(html, "Refresh now");
+    r = await owner.fetch("/dashboard/health", { method: "POST", body: refreshForm });
+    check("non-staff can't run Refresh now (replayed action refused)",
+      !(r.headers.get("location") ?? "").includes("refreshed="), `status ${r.status}`);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 async function main() {
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
@@ -709,6 +861,9 @@ async function main() {
     // --- Daily auto sync: cron route auth, runner (faked providers), client page ---
     await autoSyncChecks(tag, owner, ownerRow.id);
 
+    // --- Client Health: staff-only page, refresh runner (GHL faked), client status ---
+    await healthChecks(tag, owner, staff, formFields);
+
     // --- Remove client: agency staff only, behind a dialog; cascades to everything stored for it ---
     const [doomed] = await db.insert(clients).values({ name: `E2E remove ${tag}`, slug: `${tag}-remove` }).returning();
     await db.insert(clientMembers).values({ clientId: doomed.id, userId: ownerRow.id, role: "owner" });
@@ -728,7 +883,7 @@ async function main() {
         staffView.includes("1 stored payment and their match results") && staffView.includes("The Square connection") &&
         staffView.includes("1 team member") && staffView.includes("1 pending invite"),
     );
-    const removeForm = formFields(staffView, "Cancel");
+    const removeForm = formFields(staffView, ">Cancel<"); // exact, so not the status picker's "Canceled"
     await owner.fetch(`/dashboard/clients/${doomed.id}`, { method: "POST", body: removeForm });
     check("client owner can't remove a client (replayed action refused)",
       (await db.select().from(clients).where(eq(clients.id, doomed.id))).length === 1);
@@ -751,6 +906,7 @@ async function main() {
       inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`, `${tag}-stripe`, `${tag}-remove`]),
     );
     await db.delete(clients).where(like(clients.slug, `${tag}-auto-%`));
+    await db.delete(clients).where(like(clients.slug, `${tag}-health-%`));
   }
 
   // Encryption round trip

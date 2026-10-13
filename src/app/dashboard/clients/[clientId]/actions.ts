@@ -8,6 +8,7 @@ import { clients, paymentConnections } from "@/db/schema";
 import { canManage, getMembership, isUuid, requireAgencyStaff, requireSession, type ClientRole } from "@/lib/access";
 import { revokeSquare } from "@/lib/connect/square";
 import { deauthorizeStripe } from "@/lib/connect/stripe";
+import { isClientStatus } from "@/lib/client-status";
 import { canManageInviteRole, createInvitation, revokeInvitation } from "@/lib/invitations";
 import { syncClient } from "@/lib/sync";
 import { formatDay, parseRange, type SyncWindow } from "@/lib/sync/window";
@@ -113,6 +114,18 @@ export async function syncAction(form: FormData) {
   }
   revalidatePath(page);
   redirect(`${page}?${result}`);
+}
+
+// Agency staff only: Active / Onboarding / Paused / Canceled (shown on the Client Health page).
+export async function setClientStatusAction(clientId: string, form: FormData) {
+  await requireAgencyStaff();
+  if (!isUuid(clientId)) throw new Error("Bad client id");
+  const status = form.get("status");
+  if (!isClientStatus(status)) throw new Error("Bad status");
+  await db.update(clients).set({ status }).where(eq(clients.id, clientId));
+  revalidatePath(`/dashboard/clients/${clientId}`);
+  revalidatePath("/dashboard/health");
+  redirect(`/dashboard/clients/${clientId}?status=saved`);
 }
 
 // Agency staff only. Permanently deletes the client and, through the foreign

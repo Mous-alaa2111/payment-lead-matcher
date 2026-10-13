@@ -16,6 +16,7 @@
     "import:ghl-clients": "tsx scripts/import-ghl-clients.ts",
     "sync": "tsx scripts/sync.ts",
     "seed:manual-square": "tsx scripts/seed-manual-square.ts",
+    "set:client-statuses": "tsx scripts/set-client-statuses.ts",
     "test:e2e": "tsx scripts/e2e.ts",
     "e2e:server": "tsx scripts/e2e-server.ts",
     "db:generate": "drizzle-kit generate",

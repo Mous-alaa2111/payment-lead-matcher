@@ -1,6 +1,7 @@
 import { relations } from "drizzle-orm";
 import {
   boolean,
+  date,
   index,
   integer,
   jsonb,
@@ -18,6 +19,10 @@ import { user } from "./auth-schema";
 // Regenerate with `npm run auth:generate`, don't hand-edit auth-schema.ts.
 export * from "./auth-schema";
 
+// Where a client stands with the agency. Set by agency staff on the client page;
+// the Client Health page shows active and onboarding clients by default.
+export const clientStatus = pgEnum("client_status", ["active", "onboarding", "paused", "canceled"]);
+
 // A client is a business whose payments we match to leads (one per GHL
 // location). Stripe/Square connections and transactions will hang off this.
 export const clients = pgTable("clients", {
@@ -26,6 +31,7 @@ export const clients = pgTable("clients", {
   slug: text("slug").notNull().unique(),
   ghlLocationId: text("ghl_location_id").unique(),
   ghlTokenEnc: text("ghl_token_enc"), // location Private Integration Token, encrypted (lib/crypto)
+  status: clientStatus("status").notNull().default("active"),
   // Daily auto sync (lib/sync/auto). Set when a run starts on this client, so a client that
   // times out goes to the back of the queue. Per-provider errors live on payment_connections
   // as for Sync now; this holds only a failure outside them.
@@ -162,6 +168,35 @@ export const paymentMatches = pgTable(
     index("payment_matches_client_paid_idx").on(t.clientId, t.paidAt),
   ],
 );
+
+// Client Health (lib/health): one row per client per week (Monday, UTC) of GHL
+// opportunity counts. A week fetched after it ended is final and never refetched.
+export const clientHealthWeeks = pgTable(
+  "client_health_weeks",
+  {
+    clientId: uuid("client_id")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    weekStart: date("week_start", { mode: "string" }).notNull(), // YYYY-MM-DD, a Monday
+    total: integer("total").notNull(), // opportunities created that week
+    contacted: integer("contacted").notNull(),
+    booked: integer("booked").notNull(), // of those, now in a booked stage (lib/health/rules isBooked)
+    won: integer("won").notNull(),
+    lost: integer("lost").notNull(),
+    revenueCents: integer("revenue_cents").notNull(), // sum of won opportunities' value
+    fetchedAt: timestamp("fetched_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.clientId, t.weekStart] })],
+);
+
+// The last Client Health refresh of each client and its error (null = it worked).
+export const clientHealthStatus = pgTable("client_health_status", {
+  clientId: uuid("client_id")
+    .primaryKey()
+    .references(() => clients.id, { onDelete: "cascade" }),
+  lastRefreshedAt: timestamp("last_refreshed_at", { withTimezone: true }).notNull(),
+  lastError: text("last_error"),
+});
 
 export const clientsRelations = relations(clients, ({ many }) => ({
   members: many(clientMembers),

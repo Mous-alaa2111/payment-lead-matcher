@@ -67,7 +67,14 @@ export default async function DashboardPage(props: PageProps<"/dashboard">) {
       )}
 
       <section className={agency ? card : undefined}>
-        <h2 className="mb-2 font-medium">{agency ? "All clients" : "Your clients"}</h2>
+        <div className="mb-2 flex items-center justify-between gap-4">
+          <h2 className="font-medium">{agency ? "All clients" : "Your clients"}</h2>
+          {agency && (
+            <Link href="/dashboard/health" className="text-sm text-brand-fg hover:underline">
+              Client Health →
+            </Link>
+          )}
+        </div>
         {myClients.length === 0 ? (
           <p className="text-sm text-zinc-500">
             {agency ? "No clients yet. Create the first one below." : "You haven't been added to any clients yet."}
