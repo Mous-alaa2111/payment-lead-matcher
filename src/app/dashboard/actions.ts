@@ -7,12 +7,13 @@ import { db } from "@/db";
 import { agencyStaff, clients, user } from "@/db/schema";
 import { requireAgencyStaff } from "@/lib/access";
 import { encrypt } from "@/lib/crypto";
+import { sendInviteEmail, type InviteEmailStatus } from "@/lib/invite-email";
 import { createInvitation, normalizeEmail, revokeStaffInvitation } from "@/lib/invitations";
 
 // Everything here is agency-only: each action checks requireAgencyStaff itself,
 // since Server Actions can be called directly, not just from the dashboard form.
 
-export type FormState = { error?: string; url?: string; email?: string };
+export type FormState = { error?: string; url?: string; email?: string; emailStatus?: InviteEmailStatus };
 
 const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
@@ -51,15 +52,16 @@ export async function inviteStaffAction(_prev: FormState, form: FormData): Promi
     .where(eq(user.email, normalizeEmail(email)));
   if (already) return { error: "That person is already agency staff." };
 
-  const { url } = await createInvitation({
+  const { invite, url } = await createInvitation({
     email,
     clientId: null,
     role: "viewer", // unused for staff invites; staff act as owner everywhere
     agencyStaff: true,
     invitedBy: session.user.id,
   });
+  const emailStatus = await sendInviteEmail({ invite, url, inviter: session.user });
   revalidatePath("/dashboard");
-  return { url, email: normalizeEmail(email) };
+  return { url, email: invite.email, emailStatus };
 }
 
 export async function removeStaffAction(form: FormData) {

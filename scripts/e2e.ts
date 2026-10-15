@@ -775,8 +775,180 @@ async function memberRemovalChecks(
   check("remaining members untouched", (await isMember(owner.userId)) && (await isMember(admin.userId)));
 }
 
+// Mock of Resend's POST /emails. Records every request; a recipient containing
+// "fail-email" gets a 422 whose message repeats the address (it must not be logged).
+type MailRequest = { path: string; auth: string; body: { from: string; to: string[]; subject: string; text: string } };
+const mailbox: MailRequest[] = [];
+async function startMailMock() {
+  const { createServer } = await import("node:http");
+  const { MAIL_MOCK_PORT } = await import("./e2e-mail");
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      const body = JSON.parse(raw || "{}");
+      mailbox.push({ path: req.url ?? "", auth: req.headers.authorization ?? "", body });
+      const fail = (body.to ?? []).some((t: string) => t.includes("fail-email"));
+      res.writeHead(fail ? 422 : 200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(fail ? { statusCode: 422, name: "validation_error", message: `Invalid recipient ${body.to}` } : { id: "mock-email-id" }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(MAIL_MOCK_PORT, resolve));
+  server.unref();
+}
+
+// Invite emails: both invite forms email the link (to the mock), failures and
+// the hourly limit still create the invite and show the link, revoking sends
+// nothing, missing settings send nothing, and no secret or link gets logged.
+async function inviteEmailChecks(
+  tag: string,
+  client: { id: string; name: string },
+  actors: { owner: Actor; admin: Actor; staff: Actor },
+  formFields: (html: string, marker: string) => FormData,
+) {
+  const { eq } = await import("drizzle-orm");
+  const { existsSync, readFileSync } = await import("node:fs");
+  const { createElement } = await import("react");
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { db } = await import("../src/db");
+  const { invitations } = await import("../src/db/schema");
+  const { sha256 } = await import("../src/lib/crypto");
+  const { createInvitation } = await import("../src/lib/invitations");
+  const { AGENCY_NAME, INVITE_EMAILS_PER_HOUR, sendInviteEmail } = await import("../src/lib/invite-email");
+  const { InviteLink } = await import("../src/components/invite-link");
+  const { MAIL_ENV, SERVER_LOG } = await import("./e2e-mail");
+  const { owner, admin, staff } = actors;
+  const links: string[] = [];
+  const clientPage = `/dashboard/clients/${client.id}`;
+
+  // Submits an invite form like a browser without JS; the response is the page with the form's result.
+  const invite = async (who: Actor, path: string, marker: string, fields: Record<string, string>) => {
+    const fd = formFields(await (await who.jar.fetch(path)).text(), marker);
+    for (const [k, v] of Object.entries(fields)) fd.set(k, v);
+    const before = mailbox.length;
+    const r = await who.jar.fetch(path, { method: "POST", body: fd });
+    const html = (await r.text()).replace(/<!-- -->/g, "");
+    const link = html.match(/<code[^>]*>(https?:\/\/[^<]*\/invite\/[^<]+)<\/code>/)?.[1] ?? "";
+    if (link) links.push(link);
+    const [row] = await db.select().from(invitations).where(eq(invitations.email, fields.email));
+    return { html, link, row, mail: mailbox.slice(before) };
+  };
+  const tokenHashOf = (link: string) => sha256(link.split("/invite/")[1] ?? "");
+  const couldntSend = /Email couldn(&#x27;|')t be sent, copy the link below\./;
+
+  // Team form (client owner, admin role)
+  const teamEmail = `${tag}-mail-team@example.com`;
+  let res = await invite(owner, clientPage, "Create invite", { email: teamEmail, role: "admin" });
+  let m = res.mail[0];
+  check("Team form: invite is emailed once, to the invitee", res.mail.length === 1 && m.body.to.join() === teamEmail, `${res.mail.length} sent`);
+  check("email goes to Resend's /emails with the configured key and from address",
+    m?.path === "/emails" && m.auth === `Bearer ${MAIL_ENV.RESEND_API_KEY}` && m.body.from === MAIL_ENV.EMAIL_FROM_ADDRESS);
+  check("Team email: subject names the client; body has inviter, client, role, link and expiry",
+    m?.body.subject === `You're invited to ${client.name}` && m.body.text.includes(`E2E invited you to ${client.name}`) &&
+      m.body.text.includes("Role: admin") && Boolean(res.link) && m.body.text.includes(res.link) &&
+      /expires on \w+ \d{1,2}, \d{4}/.test(m.body.text),
+    m?.body.subject);
+  check("Team form: page says Email sent and still shows the link",
+    res.html.includes(`Email sent to <strong>${teamEmail}</strong>`) && Boolean(res.link));
+  check("emailed link is the stored invite's link", Boolean(res.row) && res.row.tokenHash === tokenHashOf(res.link));
+
+  // Agency team form (staff)
+  const staffEmail = `${tag}-mail-staff@example.com`;
+  res = await invite(staff, "/dashboard", "Invite agency staff", { email: staffEmail });
+  m = res.mail[0];
+  check("Agency form: invite is emailed once, to the invitee", res.mail.length === 1 && m.body.to.join() === staffEmail, `${res.mail.length} sent`);
+  check("Agency email: subject names the agency; body has role and link",
+    m?.body.subject === `You're invited to ${AGENCY_NAME}` && m.body.text.includes("Role: agency staff") && m.body.text.includes(res.link),
+    m?.body.subject);
+  check("Agency form: page says Email sent and still shows the link",
+    res.html.includes(`Email sent to <strong>${staffEmail}</strong>`) && Boolean(res.link) && res.row?.tokenHash === tokenHashOf(res.link));
+
+  // Provider refuses the send: the invite still exists and its link is shown.
+  const failEmail = `${tag}-fail-email@example.com`;
+  res = await invite(owner, clientPage, "Create invite", { email: failEmail, role: "viewer" });
+  check("failed send: invite still created, page says the email couldn't be sent and shows the link",
+    res.mail.length === 1 && Boolean(res.row) && couldntSend.test(res.html) && res.row.tokenHash === tokenHashOf(res.link) &&
+      !res.html.includes(`Email sent to <strong>${failEmail}`));
+
+  // Revoking (owner's Revoke button, replayed) sends nothing.
+  const before = mailbox.length;
+  const revokeForm = formFields(await (await owner.jar.fetch(clientPage)).text(), `value="${res.row.id}"`);
+  await owner.jar.fetch(clientPage, { method: "POST", body: revokeForm });
+  check("revoking an invite sends no email",
+    mailbox.length === before && (await db.select().from(invitations).where(eq(invitations.id, res.row.id))).length === 0);
+
+  // Hourly limit per inviting user: the admin already created INVITE_EMAILS_PER_HOUR invites this hour.
+  for (let i = 0; i < INVITE_EMAILS_PER_HOUR; i++) {
+    await createInvitation({ email: `${tag}-rl-${i}@example.com`, clientId: client.id, role: "viewer", invitedBy: admin.userId });
+  }
+  const limitedEmail = `${tag}-mail-limited@example.com`;
+  res = await invite(admin, clientPage, "Create invite", { email: limitedEmail, role: "viewer" });
+  check(`over ${INVITE_EMAILS_PER_HOUR} invites an hour: no email sent, invite still created with its link`,
+    res.mail.length === 0 && Boolean(res.row) && couldntSend.test(res.html) && res.row.tokenHash === tokenHashOf(res.link),
+    `${res.mail.length} sent`);
+
+  // Missing settings, in-process: nothing is sent and the result is "not_configured".
+  const [teamRow] = await db.select().from(invitations).where(eq(invitations.email, teamEmail));
+  const saved = { ...process.env };
+  const captured: string[] = [];
+  const realConsole = { log: console.log, warn: console.warn, error: console.error };
+  for (const k of ["log", "warn", "error"] as const) console[k] = (...a: unknown[]) => void captured.push(a.map(String).join(" "));
+  const sendWith = async (env: Partial<typeof MAIL_ENV>) => {
+    for (const k of Object.keys(MAIL_ENV) as (keyof typeof MAIL_ENV)[]) {
+      if (env[k] === undefined) delete process.env[k];
+      else process.env[k] = env[k];
+    }
+    const n = mailbox.length;
+    const status = await sendInviteEmail({ invite: teamRow, url: `${BASE}/invite/in-process-token`, inviter: { id: owner.userId, name: "E2E", email: "x@example.com" } });
+    return { status, sent: mailbox.length - n };
+  };
+  const url = MAIL_ENV.RESEND_API_URL;
+  const results: Awaited<ReturnType<typeof sendWith>>[] = [];
+  try {
+    results.push(await sendWith({ EMAIL_FROM_ADDRESS: MAIL_ENV.EMAIL_FROM_ADDRESS, RESEND_API_URL: url }));
+    results.push(await sendWith({ RESEND_API_KEY: MAIL_ENV.RESEND_API_KEY, RESEND_API_URL: url }));
+    results.push(await sendWith({ RESEND_API_URL: url }));
+    results.push(await sendWith(MAIL_ENV));
+  } finally {
+    Object.assign(console, realConsole);
+    for (const k of Object.keys(MAIL_ENV)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+  const [noKey, noFrom, neither, both] = results;
+  check("missing RESEND_API_KEY: nothing sent", noKey.status === "not_configured" && noKey.sent === 0, noKey.status);
+  check("missing EMAIL_FROM_ADDRESS: nothing sent", noFrom.status === "not_configured" && noFrom.sent === 0, noFrom.status);
+  check("neither set: nothing sent", neither.status === "not_configured" && neither.sent === 0, neither.status);
+  check("both set: the same call sends", both.status === "sent" && both.sent === 1, both.status);
+  const fallback = renderToStaticMarkup(createElement(InviteLink, { label: "Invite link", email: teamEmail, url: links[0], emailStatus: "not_configured" }));
+  check("not configured: the result shows the link only, as before (no email message)",
+    fallback.includes(links[0]) && !fallback.includes("Email sent") && !/Email couldn/.test(fallback));
+
+  // Logs: only success/failure and the provider's error code.
+  const serverLog = existsSync(SERVER_LOG) ? readFileSync(SERVER_LOG, "utf8") : "";
+  check("server log captured, with send results and the provider's error code",
+    serverLog.includes("[invite-email] sent") && serverLog.includes("[invite-email] send failed: validation_error") &&
+      serverLog.includes("[invite-email] not sent: rate_limited"),
+    serverLog ? "" : `no log at ${SERVER_LOG}; start the app with npm run e2e:server`);
+  const secrets = [
+    MAIL_ENV.RESEND_API_KEY,
+    ...links,
+    ...links.map((l) => l.split("/invite/")[1]),
+    "in-process-token",
+    "invited you to",
+    "Invalid recipient",
+    failEmail,
+  ].filter(Boolean);
+  const leaked = (text: string) => secrets.filter((s) => text.includes(s)).length;
+  check("no API key, invite link, token, email body or recipient in the server log", Boolean(serverLog) && leaked(serverLog) === 0, `${leaked(serverLog)} leaked`);
+  check("in-process sends log only the result", captured.length > 0 && leaked(captured.join("\n")) === 0 && captured.every((l) => l.startsWith("[invite-email]")),
+    `${captured.length} lines`);
+}
+
 async function main() {
   await warmUpE2EDatabase();
+  await startMailMock();
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
   const { agencyStaff, clients, clientMembers, invitations, paymentConnections, paymentMatches, user } = await import("../src/db/schema");
@@ -1083,6 +1255,13 @@ async function main() {
       owner: { jar: owner, userId: ownerRow.id },
       admin: { jar: admin, userId: adminRow.id },
       viewer: { jar: viewer, userId: viewerRow.id },
+    }, formFields);
+
+    // --- Invite emails (to the suite's Resend mock): both forms, failures, limit, settings, logs ---
+    await inviteEmailChecks(tag, client, {
+      owner: { jar: owner, userId: ownerRow.id },
+      admin: { jar: admin, userId: adminRow.id },
+      staff: { jar: staff, userId: staffRow.id },
     }, formFields);
 
     // --- Remove client: agency staff only, behind a dialog; cascades to everything stored for it ---

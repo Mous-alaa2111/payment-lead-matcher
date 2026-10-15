@@ -1,6 +1,7 @@
 "use client";
 
 import { useActionState } from "react";
+import { InviteLink } from "@/components/invite-link";
 import { SubmitButton } from "@/components/submit-button";
 import { createClientAction, inviteStaffAction, type FormState } from "./actions";
 
@@ -46,13 +47,8 @@ export function StaffInviteForm() {
         </SubmitButton>
       </div>
       {state.error && <p className="text-sm text-red-600">{state.error}</p>}
-      {state.url && (
-        <div className="rounded-md bg-zinc-100 p-3 text-sm dark:bg-zinc-800">
-          <p className="mb-1">
-            Agency invite link for <strong>{state.email}</strong> (expires in 7 days, shown once):
-          </p>
-          <code className="block break-all">{state.url}</code>
-        </div>
+      {state.url && state.email && (
+        <InviteLink label="Agency invite link" email={state.email} url={state.url} emailStatus={state.emailStatus} />
       )}
     </form>
   );

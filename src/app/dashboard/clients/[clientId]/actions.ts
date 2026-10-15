@@ -18,6 +18,7 @@ import {
 import { revokeSquare } from "@/lib/connect/square";
 import { deauthorizeStripe } from "@/lib/connect/stripe";
 import { isClientStatus } from "@/lib/client-status";
+import { sendInviteEmail, type InviteEmailStatus } from "@/lib/invite-email";
 import { canManageInviteRole, createInvitation, revokeInvitation } from "@/lib/invitations";
 import { syncClient } from "@/lib/sync";
 import { formatDay, parseRange, type SyncWindow } from "@/lib/sync/window";
@@ -32,7 +33,7 @@ async function requireManager(clientId: string) {
   return { session, membership };
 }
 
-export type InviteState = { url?: string; email?: string; error?: string };
+export type InviteState = { url?: string; email?: string; error?: string; emailStatus?: InviteEmailStatus };
 
 export async function inviteAction(_prev: InviteState, form: FormData): Promise<InviteState> {
   const clientId = String(form.get("clientId"));
@@ -44,9 +45,10 @@ export async function inviteAction(_prev: InviteState, form: FormData): Promise<
   if (!ROLES.includes(role)) return { error: "Pick a role." };
   if (!canManageInviteRole(membership.role, role)) return { error: "Only owners can invite owners." };
 
-  const { url } = await createInvitation({ email, clientId, role, invitedBy: session.user.id });
+  const { invite, url } = await createInvitation({ email, clientId, role, invitedBy: session.user.id });
+  const emailStatus = await sendInviteEmail({ invite, url, inviter: session.user });
   revalidatePath(`/dashboard/clients/${clientId}`);
-  return { url, email };
+  return { url, email: invite.email, emailStatus };
 }
 
 export async function revokeInviteAction(form: FormData) {
