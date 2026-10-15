@@ -3,7 +3,7 @@ import Link from "next/link";
 import { SubmitButton } from "@/components/submit-button";
 import { db } from "@/db";
 import { clientHealthStatus, clientHealthWeeks, clients } from "@/db/schema";
-import { requireAgencyStaff } from "@/lib/access";
+import { requireAgencyStaffOr404 } from "@/lib/access";
 import { CLIENT_STATUS_LABEL, type ClientStatus } from "@/lib/client-status";
 import { BOOKED_RATE_THRESHOLD, clientHealth, isoDay, weekStart, type HealthKey } from "@/lib/health/rules";
 import { refreshHealthAction } from "./actions";
@@ -32,7 +32,7 @@ const utc = (d: Date) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`
 const shortDay = (iso: string) => new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
 
 export default async function HealthPage(props: PageProps<"/dashboard/health">) {
-  await requireAgencyStaff();
+  await requireAgencyStaffOr404();
   const search = await props.searchParams;
   const filter: Filter = typeof search.show === "string" && search.show in FILTERS ? (search.show as Filter) : "current";
 

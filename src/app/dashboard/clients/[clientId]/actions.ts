@@ -4,8 +4,17 @@ import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { db } from "@/db";
-import { clients, paymentConnections } from "@/db/schema";
-import { canManage, getMembership, isUuid, requireAgencyStaff, requireSession, type ClientRole } from "@/lib/access";
+import { clientMembers, clients, paymentConnections, user } from "@/db/schema";
+import {
+  canManage,
+  canRemoveMember,
+  getMembership,
+  isUuid,
+  requireAgencyStaff,
+  requireAgencyStaffOr404,
+  requireSession,
+  type ClientRole,
+} from "@/lib/access";
 import { revokeSquare } from "@/lib/connect/square";
 import { deauthorizeStripe } from "@/lib/connect/stripe";
 import { isClientStatus } from "@/lib/client-status";
@@ -49,6 +58,29 @@ export async function revokeInviteAction(form: FormData) {
   const result = await revokeInvitation({ inviteId, clientId, actorRole: membership.role });
   if (result === "forbidden") throw new Error("Only owners can revoke owner invites");
   revalidatePath(`/dashboard/clients/${clientId}`);
+}
+
+// Takes one person off this client's team. Deletes only their membership of
+// this client: their login, their other clients and their accepted invites stay.
+// Same rules as the Remove button (canRemoveMember), checked here too since
+// Server Actions can be called directly.
+export async function removeMemberAction(clientId: string, form: FormData) {
+  const { session, membership } = await requireManager(clientId);
+  const userId = String(form.get("userId") ?? "");
+  const where = and(eq(clientMembers.clientId, clientId), eq(clientMembers.userId, userId));
+  const [target] = await db
+    .select({ role: clientMembers.role, name: user.name, email: user.email })
+    .from(clientMembers)
+    .innerJoin(user, eq(clientMembers.userId, user.id))
+    .where(where);
+  if (!target) throw new Error("Not a member of this client");
+  if (!canRemoveMember({ userId: session.user.id, role: membership.role }, { userId, role: target.role })) {
+    throw new Error("Forbidden");
+  }
+  await db.delete(clientMembers).where(where);
+  const page = `/dashboard/clients/${clientId}`;
+  revalidatePath(page);
+  redirect(`${page}?${new URLSearchParams({ memberRemoved: target.name || target.email })}`);
 }
 
 export async function disconnectAction(form: FormData) {
@@ -118,7 +150,7 @@ export async function syncAction(form: FormData) {
 
 // Agency staff only: Active / Onboarding / Paused / Canceled (shown on the Client Health page).
 export async function setClientStatusAction(clientId: string, form: FormData) {
-  await requireAgencyStaff();
+  await requireAgencyStaffOr404();
   if (!isUuid(clientId)) throw new Error("Bad client id");
   const status = form.get("status");
   if (!isClientStatus(status)) throw new Error("Bad status");

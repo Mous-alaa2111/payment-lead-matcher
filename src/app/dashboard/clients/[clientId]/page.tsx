@@ -4,7 +4,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { db } from "@/db";
 import { clientMembers, invitations, paymentConnections, paymentMatches, user } from "@/db/schema";
-import { canManage, getMembership, isUuid, requireSession } from "@/lib/access";
+import { canManage, canRemoveMember, getMembership, isUuid, requireSession } from "@/lib/access";
 import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
@@ -16,6 +16,7 @@ import { disconnectAction, revokeInviteAction, setClientStatusAction, syncAction
 import { SubmitButton } from "@/components/submit-button";
 import { InviteForm } from "./invite-form";
 import { RemoveClient } from "./remove-client";
+import { RemoveMember } from "./remove-member";
 
 // Server Actions on this page (Sync now, date-range backfills) may run long.
 export const maxDuration = 300;
@@ -81,7 +82,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
   const [connections, members, pendingInvites, statusCounts] = await Promise.all([
     db.select().from(paymentConnections).where(eq(paymentConnections.clientId, clientId)),
     db
-      .select({ name: user.name, email: user.email, role: clientMembers.role })
+      .select({ userId: clientMembers.userId, name: user.name, email: user.email, role: clientMembers.role })
       .from(clientMembers)
       .innerJoin(user, eq(clientMembers.userId, user.id))
       .where(eq(clientMembers.clientId, clientId)),
@@ -159,8 +160,11 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
     search.synced && `Sync finished: ${search.synced} payment${search.synced === "1" ? "" : "s"} fetched`;
   const partial = search.partial ? " One account failed to sync; the error is shown under Payments." : "";
   const rangeError = parsedRange && "error" in parsedRange ? parsedRange.error : null;
+  const memberRemoved = typeof search.memberRemoved === "string" ? search.memberRemoved : null;
   const flash = rangeError
     ? rangeError
+    : memberRemoved
+    ? `Removed ${memberRemoved} from ${client.name}.`
     : syncDone
     ? range
       ? `${syncDone} for ${range.from} to ${range.to} (UTC).${partial}`
@@ -453,11 +457,16 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         )}
         <ul className="divide-y divide-panel-border rounded-lg border border-panel-border empty:hidden">
           {members.map((m) => (
-            <li key={m.email} className="flex justify-between px-4 py-3 text-sm">
+            <li key={m.userId} className="flex items-center justify-between gap-4 px-4 py-3 text-sm">
               <span>
                 {m.name} <span className="text-zinc-500">· {m.email}</span>
               </span>
-              <span className="text-zinc-500">{m.role}</span>
+              <span className="flex items-center gap-3 text-zinc-500">
+                {m.role}
+                {canRemoveMember({ userId: session.user.id, role }, m) && (
+                  <RemoveMember clientId={clientId} clientName={client.name} userId={m.userId} name={m.name || m.email} />
+                )}
+              </span>
             </li>
           ))}
           {pendingInvites.map((i) => (

@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { headers } from "next/headers";
-import { redirect } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { db } from "@/db";
 import { agencyStaff, clientMembers, clients } from "@/db/schema";
 import { auth } from "@/lib/auth";
@@ -30,6 +30,14 @@ export async function requireAgencyStaff() {
   return session;
 }
 
+// Same check, but a signed-in non-staff user gets a plain 404, as the client
+// pages give non-members, so staff-only pages and actions don't reveal they exist.
+export async function requireAgencyStaffOr404() {
+  const session = await requireSession();
+  if (!(await isAgencyStaff(session.user.id))) notFound();
+  return session;
+}
+
 // The client and the user's effective role on it, or null if they have no access.
 // Agency staff act as owner on every client (agency: true); everyone else needs
 // a client_members row.
@@ -49,6 +57,16 @@ export async function getMembership(userId: string, clientId: string) {
 
 export function canManage(role: ClientRole) {
   return MANAGE_ROLES.includes(role);
+}
+
+// Who can take whom off a client's team. Owners (and agency staff, who act as
+// owner) can remove anyone; admins can remove viewers and other admins but not
+// owners; viewers can't remove anyone. Nobody can remove themselves.
+export function canRemoveMember(actor: { userId: string; role: ClientRole }, target: { userId: string; role: ClientRole }) {
+  if (actor.userId === target.userId) return false;
+  if (actor.role === "owner") return true;
+  if (actor.role === "admin") return target.role !== "owner";
+  return false;
 }
 
 export function isUuid(value: string) {

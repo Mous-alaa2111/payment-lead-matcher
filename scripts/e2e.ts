@@ -22,6 +22,46 @@ const check = (name: string, ok: boolean, extra = "") => {
   if (!ok) failures++;
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? `  (${extra})` : ""}`);
 };
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Neon over HTTP drops a connection now and then (a timed-out fetch, not a SQL error).
+function isConnectionError(e: unknown) {
+  for (let c = e as { message?: string; code?: string; name?: string; cause?: unknown; sourceError?: unknown } | undefined, d = 0; c && d < 6; d++) {
+    if (/fetch failed|error connecting to database|ConnectTimeout|ECONNRESET|ETIMEDOUT/i.test(`${c.message ?? ""} ${c.code ?? ""} ${c.name ?? ""}`)) return true;
+    c = (c.cause ?? c.sourceError) as typeof c;
+  }
+  return false;
+}
+
+// Retries `fn` on connection errors only; any other error is thrown at once.
+async function retryOnConnectionError<T>(fn: () => Promise<T>, attempts = 4, waitMs = 3000): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt >= attempts || !isConnectionError(e)) throw e;
+      await sleep(waitMs);
+    }
+  }
+}
+
+// Before the suite writes anything: the e2e branch must answer `select 1`
+// (3 tries, ~5 s apart), so a cold or unreachable branch stops the run here
+// instead of failing checks halfway through.
+async function warmUpE2EDatabase() {
+  const { sql } = await import("../src/db");
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await sql`select 1`;
+      return;
+    } catch (e) {
+      console.log(`e2e database warm-up ${attempt}/3 failed: ${(e as Error).message}`);
+      if (attempt < 3) await sleep(5000);
+    }
+  }
+  console.error("e2e database unreachable: `select 1` failed 3 times. Not running the suite.");
+  process.exit(1);
+}
 
 class Jar {
   cookies = new Map<string, string>();
@@ -185,6 +225,28 @@ async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
       return fd;
     };
     const before = (await conn()).lastSyncedAt?.getTime();
+    const callsBefore = paymentCalls.length;
+
+    // Viewer filtering by a range: the table and counts change, nothing is synced, no sync buttons.
+    const tableOf = (html: string) => {
+      const body = html.slice(html.indexOf("<tbody"), html.indexOf("</tbody>"));
+      return { rows: body.match(/<tr class="align-top"/g)?.length ?? 0, amounts: [...body.matchAll(/\$[\d,]+\.\d\d/g)].map((m) => m[0]) };
+    };
+    const unfiltered = tableOf(viewerPage);
+    const rangeHtml = (
+      await (await viewer.fetch(`/dashboard/clients/${c.id}?from=${formatDay(range.start)}&to=${formatDay(new Date(range.end.getTime() - DAY))}`)).text()
+    ).replace(/<!-- -->/g, "");
+    const inRange = tableOf(rangeHtml);
+    check("viewer sees all 5 payments before filtering", unfiltered.rows === 5 && viewerPage.includes("5 payments:"), `rows ${unfiltered.rows}`);
+    check(
+      "viewer filtering by a range changes the table and counts",
+      inRange.rows === 3 && rangeHtml.includes("3 payments:") && rangeHtml.includes("Showing payments from") &&
+        ["$30.00", "$40.00", "$50.00"].every((a) => inRange.amounts.includes(a)) && !inRange.amounts.includes("$10.00"),
+      `rows ${inRange.rows}: ${inRange.amounts.join(" ")}`,
+    );
+    check("viewer's filtered page has no sync buttons", !/>Sync (now|range)</.test(rangeHtml));
+    check("viewer filtering doesn't run a sync", (await conn()).lastSyncedAt?.getTime() === before && paymentCalls.length === callsBefore);
+
     const res = await owner.fetch(`/dashboard/clients/${c.id}`, { method: "POST", body: syncRangeForm("2026-02-01", "2026-01-01") });
     const loc = res.headers.get("location") ?? "";
     check("reversed date range is rejected with a message", loc.includes("error=bad_range"), `${res.status} ${loc}`);
@@ -194,7 +256,8 @@ async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
     const afterViewer = await conn();
     check(
       "viewer replaying Sync range is refused",
-      !(vres.headers.get("location") ?? "").includes("synced=") && afterViewer.lastSyncedAt?.getTime() === before && !afterViewer.lastSyncError,
+      !(vres.headers.get("location") ?? "").includes("synced=") && afterViewer.lastSyncedAt?.getTime() === before &&
+        !afterViewer.lastSyncError && paymentCalls.length === callsBefore,
       `status ${vres.status}`,
     );
     const filtered = (await (await viewer.fetch(`/dashboard/clients/${c.id}?from=2000-01-01&to=2000-01-02`)).text()).replace(/<!-- -->/g, "");
@@ -486,7 +549,7 @@ async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, 
     let r: Response;
     for (const { role, jar } of clientUsers) {
       r = await jar.fetch("/dashboard/health");
-      check(`Client Health page is refused to a client ${role}`, r.status !== 200 && !(await r.text()).includes("Refresh now"), `status ${r.status}`);
+      check(`Client Health page is a plain 404 for a client ${role}`, r.status === 404 && !(await r.text()).includes("Refresh now"), `status ${r.status}`);
       const dash = await (await jar.fetch("/dashboard")).text();
       check(`a client ${role}'s dashboard has no Client Health link`, dash.includes("Your clients") && !dash.includes("/dashboard/health"));
     }
@@ -558,8 +621,8 @@ async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, 
       // Hand-built: staff's status form (action id, bound client id) replayed with this user's cookies.
       statusForm.set("status", "canceled");
       r = await jar.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
-      check(`a client ${role} can't change status (replayed action refused)`,
-        (await statusOf()) === "active" && !(r.headers.get("location") ?? "").includes("status=saved"), `status ${r.status}`);
+      check(`a client ${role} changing status gets a 404 (replayed action refused)`,
+        r.status === 404 && (await statusOf()) === "active" && !(r.headers.get("location") ?? "").includes("status=saved"), `status ${r.status}`);
     }
     statusForm.set("status", "bogus");
     await staff.fetch(`/dashboard/clients/${good.id}`, { method: "POST", body: statusForm });
@@ -585,8 +648,8 @@ async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, 
     const before = await lastRefresh();
     for (const { role, jar } of clientUsers) {
       r = await jar.fetch("/dashboard/health", { method: "POST", body: refreshForm });
-      check(`a client ${role} can't run Refresh now (replayed action refused)`,
-        r.status !== 303 && !(r.headers.get("location") ?? "").includes("refreshed=") && (await lastRefresh()) === before,
+      check(`a client ${role} running Refresh now gets a 404 (replayed action refused)`,
+        r.status === 404 && !(r.headers.get("location") ?? "").includes("refreshed=") && (await lastRefresh()) === before,
         `status ${r.status}`);
     }
   } finally {
@@ -594,7 +657,126 @@ async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, 
   }
 }
 
+// Remove team member: who sees Remove on whose row, the server refusing the same
+// removals when hand-built, and what a removal deletes. Actors are real signed-in
+// users; extra targets are inserted directly (they never sign in).
+type Actor = { jar: Jar; userId: string };
+async function memberRemovalChecks(
+  tag: string,
+  actors: { staff: Actor; owner: Actor; admin: Actor; viewer: Actor },
+  formFields: (html: string, marker: string) => FormData,
+) {
+  const { and, eq } = await import("drizzle-orm");
+  const { db } = await import("../src/db");
+  const { clients, clientMembers, user } = await import("../src/db/schema");
+  const { staff, owner, admin, viewer } = actors;
+
+  const [c] = await db.insert(clients).values({ name: `E2E members ${tag}`, slug: `${tag}-members` }).returning();
+  const [other] = await db.insert(clients).values({ name: `E2E members other ${tag}`, slug: `${tag}-members-other` }).returning();
+  const target = async (key: string, role: "owner" | "admin" | "viewer") => {
+    const id = `${tag}-${key}`;
+    await db.insert(user).values({ id, name: `Target ${key}`, email: `${tag}-${key}@example.com` });
+    await db.insert(clientMembers).values({ clientId: c.id, userId: id, role });
+    return id;
+  };
+  await db.insert(clientMembers).values([
+    { clientId: c.id, userId: owner.userId, role: "owner" },
+    { clientId: c.id, userId: admin.userId, role: "admin" },
+    { clientId: c.id, userId: viewer.userId, role: "viewer" },
+  ]);
+  const owner2 = await target("t-owner2", "owner");
+  const owner3 = await target("t-owner3", "owner");
+  const admin2 = await target("t-admin2", "admin");
+  const viewer2 = await target("t-viewer2", "viewer");
+  const viewer3 = await target("t-viewer3", "viewer");
+  // Only a member of the other client: a removal posted to this client must not touch it.
+  const outsider = `${tag}-t-outsider`;
+  await db.insert(user).values({ id: outsider, name: "Target outsider", email: `${tag}-t-outsider@example.com` });
+  await db.insert(clientMembers).values({ clientId: other.id, userId: outsider, role: "viewer" });
+
+  const page = `/dashboard/clients/${c.id}`;
+  const isMember = async (userId: string, clientId = c.id) =>
+    (await db.select().from(clientMembers).where(and(eq(clientMembers.clientId, clientId), eq(clientMembers.userId, userId)))).length === 1;
+  // Each Team row is an <li>; a Remove button sits in the row with its member's email.
+  const removable = async (jar: Jar) => {
+    const html = (await (await jar.fetch(page)).text()).replace(/<!-- -->/g, "");
+    const team = html.slice(html.indexOf(">Team<"));
+    const rows = team.split(/<li[ >]/).slice(1).map((li) => li.split("</li>")[0]);
+    return {
+      html,
+      ids: rows.filter((li) => li.includes(">Remove<")).map((li) => li.match(/name="userId" value="([^"]+)"/)?.[1]).filter(Boolean),
+    };
+  };
+  const everyone = [owner.userId, admin.userId, viewer.userId, owner2, owner3, admin2, viewer2, viewer3];
+  const same = (a: unknown[], b: string[]) => a.length === b.length && b.every((x) => a.includes(x));
+
+  let v = await removable(staff.jar);
+  check("staff see Remove on every team member", same(v.ids, everyone), `${v.ids.length} of ${everyone.length}`);
+  check(
+    "Remove opens a dialog naming the member and client",
+    v.html.includes("<dialog") && v.html.includes(`Remove Target t-viewer2 from E2E members ${tag}?`) &&
+      v.html.includes("They will lose access to this client. Their login stays."),
+  );
+  const staffPage = v.html;
+  v = await removable(owner.jar);
+  check("client owner sees Remove on everyone but themselves", same(v.ids, everyone.filter((id) => id !== owner.userId)), `${v.ids.length}`);
+  v = await removable(admin.jar);
+  check("admin sees Remove on admins and viewers only, not owners or themselves",
+    same(v.ids, [viewer.userId, admin2, viewer2, viewer3]), `${v.ids.length}`);
+  v = await removable(viewer.jar);
+  check("viewer sees no Remove buttons", v.ids.length === 0 && v.html.includes("Target t-viewer2"), `${v.ids.length}`);
+
+  // Hand-built: staff's Remove form for `userId` (action id, bound client id), sent with another user's cookies.
+  const removal = (userId: string) => {
+    const fd = formFields(staffPage, `name="userId" value="${owner.userId}"`);
+    fd.set("userId", userId);
+    return fd;
+  };
+  const post = (who: Actor, userId: string) => who.jar.fetch(page, { method: "POST", body: removal(userId) });
+  const refused = async (label: string, who: Actor, userId: string, clientId = c.id) => {
+    const r = await post(who, userId);
+    check(`${label} (hand-built request refused)`,
+      (await isMember(userId, clientId)) && !(r.headers.get("location") ?? "").includes("memberRemoved="), `status ${r.status}`);
+  };
+  const removed = async (label: string, who: Actor, userId: string) => {
+    const r = await post(who, userId);
+    const loc = decodeURIComponent((r.headers.get("location") ?? "").replace(/\+/g, " "));
+    check(label, !(await isMember(userId)) && loc.includes("memberRemoved="), `status ${r.status} ${loc}`);
+    return loc;
+  };
+
+  await refused("viewer can't remove another viewer", viewer, viewer2);
+  await refused("viewer can't remove an owner", viewer, owner2);
+  await refused("viewer can't remove themselves", viewer, viewer.userId);
+  await refused("admin can't remove an owner", admin, owner2);
+  await refused("admin can't remove themselves", admin, admin.userId);
+  await refused("owner can't remove themselves", owner, owner.userId);
+  await db.insert(clientMembers).values({ clientId: c.id, userId: staff.userId, role: "viewer" });
+  await refused("staff can't remove their own membership", staff, staff.userId);
+  await db.delete(clientMembers).where(and(eq(clientMembers.clientId, c.id), eq(clientMembers.userId, staff.userId)));
+  await refused("removal can't reach a member of a different client", owner, outsider, other.id);
+
+  await removed("admin removes a viewer", admin, viewer3);
+  await removed("admin removes another admin", admin, admin2);
+  const loc = await removed("owner removes another owner", owner, owner2);
+  check("removal shows who was removed from which client", (await (await owner.jar.fetch(loc.replace(/^https?:\/\/[^/]+/, ""))).text())
+    .replace(/<!-- -->/g, "").includes(`Removed Target t-owner2 from E2E members ${tag}.`), loc);
+  await removed("owner removes a viewer", owner, viewer2);
+  await removed("staff remove an owner", staff, owner3);
+  await removed("staff remove a viewer", staff, viewer.userId);
+
+  const r = await viewer.jar.fetch(page);
+  check("removed user gets a 404 on that client's page", r.status === 404, `status ${r.status}`);
+  check("removal keeps the user's login and their other clients",
+    (await db.select().from(user).where(eq(user.id, viewer.userId))).length === 1 &&
+      (await db.select().from(clientMembers).where(eq(clientMembers.userId, viewer.userId))).length > 0 &&
+      (await db.select().from(user).where(eq(user.id, owner2))).length === 1);
+  check("removed user stays signed in and keeps their dashboard", (await viewer.jar.fetch("/dashboard")).status === 200);
+  check("remaining members untouched", (await isMember(owner.userId)) && (await isMember(admin.userId)));
+}
+
 async function main() {
+  await warmUpE2EDatabase();
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
   const { agencyStaff, clients, clientMembers, invitations, paymentConnections, paymentMatches, user } = await import("../src/db/schema");
@@ -895,6 +1077,14 @@ async function main() {
       { role: "viewer", jar: viewer, userId: viewerRow.id },
     ], staff, formFields);
 
+    // --- Remove team member: per-role buttons, hand-built requests refused, removed user gets a 404 ---
+    await memberRemovalChecks(tag, {
+      staff: { jar: staff, userId: staffRow.id },
+      owner: { jar: owner, userId: ownerRow.id },
+      admin: { jar: admin, userId: adminRow.id },
+      viewer: { jar: viewer, userId: viewerRow.id },
+    }, formFields);
+
     // --- Remove client: agency staff only, behind a dialog; cascades to everything stored for it ---
     const [doomed] = await db.insert(clients).values({ name: `E2E remove ${tag}`, slug: `${tag}-remove` }).returning();
     await db.insert(clientMembers).values({ clientId: doomed.id, userId: ownerRow.id, role: "owner" });
@@ -914,7 +1104,7 @@ async function main() {
         staffView.includes("1 stored payment and their match results") && staffView.includes("The Square connection") &&
         staffView.includes("1 team member") && staffView.includes("1 pending invite"),
     );
-    const removeForm = formFields(staffView, ">Cancel<"); // exact, so not the status picker's "Canceled"
+    const removeForm = formFields(staffView, ">Remove client<"); // its submit button; Remove member dialogs say just "Remove"
     await owner.fetch(`/dashboard/clients/${doomed.id}`, { method: "POST", body: removeForm });
     check("client owner can't remove a client (replayed action refused)",
       (await db.select().from(clients).where(eq(clients.id, doomed.id))).length === 1);
@@ -931,13 +1121,23 @@ async function main() {
     check("removing a client keeps its team's user accounts", (await db.select().from(user).where(eq(user.id, ownerRow.id))).length === 1);
     check("removal redirects to the dashboard with a message", (r.headers.get("location") ?? "").includes("/dashboard?removed="), `${r.status}`);
   } finally {
-    await db.delete(user).where(like(user.email, `${tag}-%`));
-    await db.delete(invitations).where(like(invitations.email, `${tag}-%`));
-    await db.delete(clients).where(
-      inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`, `${tag}-stripe`, `${tag}-remove`]),
+    // Each delete is retried on connection errors, and one failing doesn't skip the rest.
+    const cleanup = async (what: string, del: () => Promise<unknown>) => {
+      try {
+        await retryOnConnectionError(del);
+      } catch (e) {
+        check(`cleanup: delete ${what} (rows tagged ${tag} may be left on the e2e branch)`, false, (e as Error).message);
+      }
+    };
+    await cleanup("users", () => db.delete(user).where(like(user.email, `${tag}-%`)));
+    await cleanup("invitations", () => db.delete(invitations).where(like(invitations.email, `${tag}-%`)));
+    await cleanup("clients", () =>
+      db.delete(clients).where(
+        inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`, `${tag}-stripe`, `${tag}-remove`, `${tag}-members`, `${tag}-members-other`]),
+      ),
     );
-    await db.delete(clients).where(like(clients.slug, `${tag}-auto-%`));
-    await db.delete(clients).where(like(clients.slug, `${tag}-health-%`));
+    await cleanup("auto sync clients", () => db.delete(clients).where(like(clients.slug, `${tag}-auto-%`)));
+    await cleanup("health clients", () => db.delete(clients).where(like(clients.slug, `${tag}-health-%`)));
   }
 
   // Encryption round trip
