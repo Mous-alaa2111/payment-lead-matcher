@@ -4,7 +4,8 @@ import { SubmitButton } from "@/components/submit-button";
 import { db } from "@/db";
 import { clientHealthStatus, clientHealthWeeks, clients } from "@/db/schema";
 import { requireAgencyStaffOr404 } from "@/lib/access";
-import { CLIENT_STATUS_LABEL, type ClientStatus } from "@/lib/client-status";
+import { ClientStatusSelect } from "@/components/client-status-select";
+import { type ClientStatus } from "@/lib/client-status";
 import { BOOKED_RATE_THRESHOLD, clientHealth, isoDay, weekStart, type HealthKey } from "@/lib/health/rules";
 import { refreshHealthAction } from "./actions";
 
@@ -136,10 +137,12 @@ export default async function HealthPage(props: PageProps<"/dashboard/health">) 
                         <Link href={`/dashboard/clients/${r.id}`} className="font-medium hover:underline">
                           {r.name}
                         </Link>
-                        <span className="block text-xs text-zinc-500">
-                          {CLIENT_STATUS_LABEL[r.status]}
-                          {r.refresh && ` · refreshed ${utc(r.refresh.lastRefreshedAt)}`}
-                        </span>
+                        <div className="mt-1">
+                          <ClientStatusSelect clientId={r.id} clientName={r.name} status={r.status} />
+                        </div>
+                        {r.refresh && (
+                          <span className="block text-xs text-zinc-500">refreshed {utc(r.refresh.lastRefreshedAt)}</span>
+                        )}
                         {r.refresh?.lastError && (
                           <span className="mt-1 block max-w-md text-xs break-words text-red-700 dark:text-red-400">
                             Last refresh failed: {r.refresh.lastError}

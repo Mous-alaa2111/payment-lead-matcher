@@ -1,7 +1,7 @@
 import type { clients } from "@/db/schema";
 
 // Where a client stands with the agency (clients.status). Set by agency staff
-// on the client page.
+// on the client page, the dashboard or the Client Health page.
 export type ClientStatus = (typeof clients.$inferSelect)["status"];
 
 export const CLIENT_STATUSES: ClientStatus[] = ["active", "onboarding", "paused", "canceled"];

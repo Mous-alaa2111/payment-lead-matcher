@@ -1,5 +1,6 @@
 import { and, asc, eq, gt, isNull } from "drizzle-orm";
 import Link from "next/link";
+import { ClientStatusSelect } from "@/components/client-status-select";
 import { SubmitButton } from "@/components/submit-button";
 import { db } from "@/db";
 import { agencyStaff, clientMembers, clients, invitations, user } from "@/db/schema";
@@ -20,12 +21,11 @@ export default async function DashboardPage(props: PageProps<"/dashboard">) {
 
   // Agency staff see every client; everyone else only the clients they belong to.
   const myClients = agency
-    ? (await db.select({ id: clients.id, name: clients.name }).from(clients).orderBy(asc(clients.name))).map((c) => ({
-        ...c,
-        role: null,
-      }))
+    ? (
+        await db.select({ id: clients.id, name: clients.name, status: clients.status }).from(clients).orderBy(asc(clients.name))
+      ).map((c) => ({ ...c, role: null }))
     : await db
-        .select({ id: clients.id, name: clients.name, role: clientMembers.role })
+        .select({ id: clients.id, name: clients.name, status: clients.status, role: clientMembers.role })
         .from(clientMembers)
         .innerJoin(clients, eq(clientMembers.clientId, clients.id))
         .where(eq(clientMembers.userId, session.user.id))
@@ -82,14 +82,20 @@ export default async function DashboardPage(props: PageProps<"/dashboard">) {
         ) : (
           <ul className={agency ? list : `${list} bg-panel shadow-sm`}>
             {myClients.map((c) => (
-              <li key={c.id}>
+              <li key={c.id} className="flex items-center hover:bg-brand-soft">
                 <Link
                   href={`/dashboard/clients/${c.id}`}
-                  className="flex justify-between px-4 py-3 text-sm hover:bg-brand-soft"
+                  className="flex min-w-0 flex-1 justify-between gap-4 px-4 py-3 text-sm"
                 >
-                  <span>{c.name}</span>
+                  <span className="min-w-0 break-words">{c.name}</span>
                   {c.role && <span className="text-zinc-500">{c.role}</span>}
                 </Link>
+                {/* Staff only: client members never get the picker (the action refuses them too). */}
+                {agency && (
+                  <div className="shrink-0 py-2 pr-3">
+                    <ClientStatusSelect clientId={c.id} clientName={c.name} status={c.status} />
+                  </div>
+                )}
               </li>
             ))}
           </ul>

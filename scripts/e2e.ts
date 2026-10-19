@@ -606,7 +606,7 @@ async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, 
       .where(and(eq(clientHealthWeeks.clientId, good.id), inArray(clientHealthWeeks.weekStart, [mondayOf(0), mondayOf(1)])));
     check("two weeks with no activity: Red", cells(row(await page(), good.id))[1]?.includes("Red"));
 
-    // Client status: staff set it on the client page; the health page filters by it.
+    // Client status: staff set it on the client page (also the dashboard and Health page, below); the health page filters by it.
     const clientPage = (await (await staff.fetch(`/dashboard/clients/${good.id}`)).text()).replace(/<!-- -->/g, "");
     check("staff see the client status control", clientPage.includes('name="status"') && clientPage.includes("Client status"));
     const statusForm = formFields(clientPage, "Client status");
@@ -638,6 +638,53 @@ async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, 
     check("the All filter shows everyone", (await page("?show=all")).includes(`data-client="${good.id}"`));
     await db.update(clients).set({ status: "onboarding" }).where(eq(clients.id, good.id));
     check("onboarding clients are in the default view", (await page()).includes(`data-client="${good.id}"`));
+
+    // The same picker on the dashboard and the Client Health page (one action behind all three).
+    const picker = (html: string, id: string) => html.split(`data-client-status="${id}"`)[1]?.split("</form>")[0] ?? "";
+    const shows = (html: string, id: string, selected: string) => {
+      const p = picker(html, id);
+      return ["active", "onboarding", "paused", "canceled"].every((s) => p.includes(`value="${s}"`)) &&
+        new RegExp(`value="${selected}" selected=""`).test(p);
+    };
+    const clean = (res: Response) => res.text().then((t) => t.replace(/<!-- -->/g, ""));
+    let dashHtml = await clean(await staff.fetch("/dashboard"));
+    html = await page();
+    check("staff see the status picker on the dashboard row, on the stored status", shows(dashHtml, good.id, "onboarding"));
+    check("staff see the status picker on the Client Health row, on the stored status", shows(row(html, good.id), good.id, "onboarding"));
+    const dashForm = formFields(dashHtml, `data-client-status="${good.id}"`);
+    const healthForm = formFields(html, `data-client-status="${good.id}"`);
+    for (const { role, jar } of clientUsers) {
+      const own = await clean(await jar.fetch("/dashboard"));
+      check(`a client ${role}'s dashboard lists the client with no status picker`,
+        own.includes(good.name) && !own.includes("data-client-status") && !own.includes('name="status"') &&
+          !/>(Active|Onboarding|Paused|Canceled)</.test(own));
+      const ownPage = await clean(await jar.fetch(`/dashboard/clients/${good.id}`));
+      check(`a client ${role}'s client page has no status picker`, ownPage.includes(good.name) && !ownPage.includes("data-client-status"));
+      // Hand-built: the staff dashboard's and Health page's picker forms replayed with this user's cookies.
+      dashForm.set("status", "canceled");
+      r = await jar.fetch("/dashboard", { method: "POST", body: dashForm });
+      check(`a client ${role} changing status from the dashboard gets a 404, status unchanged`,
+        r.status === 404 && (await statusOf()) === "onboarding", `status ${r.status}`);
+      healthForm.set("status", "canceled");
+      r = await jar.fetch("/dashboard/health", { method: "POST", body: healthForm });
+      check(`a client ${role} changing status from Client Health gets a 404, status unchanged`,
+        r.status === 404 && (await statusOf()) === "onboarding", `status ${r.status}`);
+    }
+    healthForm.set("status", "bogus");
+    await staff.fetch("/dashboard/health", { method: "POST", body: healthForm });
+    check("an unknown status from the Health picker is refused", (await statusOf()) === "onboarding");
+    dashForm.set("status", "paused");
+    r = await staff.fetch("/dashboard", { method: "POST", body: dashForm });
+    check("staff set a client to Paused from the dashboard", r.status === 200 && (await statusOf()) === "paused", `status ${r.status}`);
+    dashHtml = await clean(await staff.fetch("/dashboard"));
+    check("the dashboard picker shows the stored Paused on reload", shows(dashHtml, good.id, "paused"));
+    healthForm.set("status", "active");
+    r = await staff.fetch("/dashboard/health", { method: "POST", body: healthForm });
+    check("staff set a client to Active from Client Health", r.status === 200 && (await statusOf()) === "active", `status ${r.status}`);
+    // No redirect or revalidation, so the page the picker sits on isn't re-rendered under it.
+    check("a status save doesn't redirect", !r.headers.get("location"), r.headers.get("location") ?? "");
+    html = await page();
+    check("the Health picker shows the stored Active on reload", shows(row(html, good.id), good.id, "active"));
 
     // Hand-built: staff's Refresh now form replayed with each client user's cookies. Had it
     // run, it would refresh every client with a token, good included (GHL isn't faked in the

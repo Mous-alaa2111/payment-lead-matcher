@@ -150,16 +150,18 @@ export async function syncAction(form: FormData) {
   redirect(`${page}?${result}`);
 }
 
-// Agency staff only: Active / Onboarding / Paused / Canceled (shown on the Client Health page).
+// Agency staff only: Active / Onboarding / Paused / Canceled. The one path behind
+// every status picker (ClientStatusSelect on the client page, dashboard and Client
+// Health page). It deliberately doesn't revalidate or redirect: that would re-render
+// the page the picker is on, and on Client Health a client that left the current
+// filter would vanish before a misclick could be undone. Those pages are rendered
+// per request, so the next load shows the new status.
 export async function setClientStatusAction(clientId: string, form: FormData) {
   await requireAgencyStaffOr404();
   if (!isUuid(clientId)) throw new Error("Bad client id");
   const status = form.get("status");
   if (!isClientStatus(status)) throw new Error("Bad status");
   await db.update(clients).set({ status }).where(eq(clients.id, clientId));
-  revalidatePath(`/dashboard/clients/${clientId}`);
-  revalidatePath("/dashboard/health");
-  redirect(`/dashboard/clients/${clientId}?status=saved`);
 }
 
 // Agency staff only. Permanently deletes the client and, through the foreign
