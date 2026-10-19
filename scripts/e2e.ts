@@ -824,7 +824,7 @@ async function memberRemovalChecks(
 
 // Mock of Resend's POST /emails. Records every request; a recipient containing
 // "fail-email" gets a 422 whose message repeats the address (it must not be logged).
-type MailRequest = { path: string; auth: string; body: { from: string; to: string[]; subject: string; text: string; html?: string } };
+type MailRequest = { path: string; auth: string; body: { from: string; to: string[]; subject: string; text: string; html?: string; reply_to?: unknown } };
 const mailbox: MailRequest[] = [];
 async function startMailMock() {
   const { createServer } = await import("node:http");
@@ -892,6 +892,7 @@ async function inviteEmailChecks(
   check("Team form: invite is emailed once, to the invitee", res.mail.length === 1 && m.body.to.join() === teamEmail, `${res.mail.length} sent`);
   check("email goes to Resend's /emails with the configured key and from address",
     m?.path === "/emails" && m.auth === `Bearer ${MAIL_ENV.RESEND_API_KEY}` && m.body.from === MAIL_ENV.EMAIL_FROM_ADDRESS);
+  check("Team email carries the EMAIL_REPLY_TO address as reply_to", m?.body.reply_to === MAIL_ENV.EMAIL_REPLY_TO);
   check("Team email: subject names the client; body has inviter, client, role, link and expiry",
     m?.body.subject === `You're invited to ${client.name}` && m.body.text.includes(`E2E invited you to ${client.name}`) &&
       m.body.text.includes("Role: admin") && Boolean(res.link) && m.body.text.includes(res.link) &&
@@ -919,6 +920,8 @@ async function inviteEmailChecks(
   check("Agency email: subject names the agency; body has role and link",
     m?.body.subject === `You're invited to ${AGENCY_NAME}` && m.body.text.includes("Role: agency staff") && m.body.text.includes(res.link),
     m?.body.subject);
+  check("Agency email carries the EMAIL_REPLY_TO address as reply_to, from address unchanged",
+    m?.body.reply_to === MAIL_ENV.EMAIL_REPLY_TO && m.body.from === MAIL_ENV.EMAIL_FROM_ADDRESS);
   check("Agency email HTML: button to the link, agency name, role in plain words",
     Boolean(res.link) && m?.body.html?.includes(`<a href="${esc(res.link)}"`) === true && m.body.html.includes(`>${AGENCY_NAME}</strong>`) &&
       m.body.html.includes("as agency staff, with access to every client."));
@@ -969,6 +972,18 @@ async function inviteEmailChecks(
   let xss: Awaited<ReturnType<typeof createInvitation>> | undefined;
   let xssStatus = "";
   let xssMail: MailRequest[] = [];
+  // EMAIL_REPLY_TO cases, in-process, each with a fresh invite: valid, then missing, empty and invalid values.
+  const badReplyTo = [`not-an-email-${tag}`, `rt-${tag}@nodot`, `Reply <rt-${tag}@e2e.example.test>`,
+    `rt-${tag}@e2e.example.test, rt2-${tag}@e2e.example.test`, `rt-${tag}@e2e.example.test\r\nBcc: x@e2e.example.test`];
+  const replyToCases: { label: string; value: string | undefined; expect: string | undefined }[] = [
+    { label: "valid", value: MAIL_ENV.EMAIL_REPLY_TO, expect: MAIL_ENV.EMAIL_REPLY_TO },
+    { label: "valid, with spaces around it", value: `  ${MAIL_ENV.EMAIL_REPLY_TO} `, expect: MAIL_ENV.EMAIL_REPLY_TO },
+    { label: "missing", value: undefined, expect: undefined },
+    { label: "empty", value: "", expect: undefined },
+    { label: "blank", value: "   ", expect: undefined },
+    ...badReplyTo.map((value, i) => ({ label: `invalid #${i + 1}`, value, expect: undefined })),
+  ];
+  const replyToResults: { label: string; expect: string | undefined; status: string; mail: MailRequest[]; invited: boolean }[] = [];
   try {
     results.push(await sendWith({ EMAIL_FROM_ADDRESS: MAIL_ENV.EMAIL_FROM_ADDRESS, RESEND_API_URL: url }));
     results.push(await sendWith({ RESEND_API_KEY: MAIL_ENV.RESEND_API_KEY, RESEND_API_URL: url }));
@@ -981,6 +996,17 @@ async function inviteEmailChecks(
     const n = mailbox.length;
     xssStatus = await sendInviteEmail({ invite: xss.invite, url: xss.url, inviter: { id: owner.userId, name: `O'Neil <b>Boss</b>`, email: "x@example.com" } });
     xssMail = mailbox.slice(n);
+    for (const [i, c] of replyToCases.entries()) {
+      for (const k of Object.keys(MAIL_ENV) as (keyof typeof MAIL_ENV)[]) process.env[k] = MAIL_ENV[k];
+      if (c.value === undefined) delete process.env.EMAIL_REPLY_TO;
+      else process.env.EMAIL_REPLY_TO = c.value;
+      const created = await createInvitation({ email: `${tag}-mail-rt${i}@example.com`, clientId: client.id, role: "viewer", invitedBy: null });
+      const before = mailbox.length;
+      const status = await sendInviteEmail({ invite: created.invite, url: created.url, inviter: { id: owner.userId, name: "E2E", email: "x@example.com" } });
+      const invited = (await db.select().from(invitations).where(eq(invitations.id, created.invite.id))).length === 1;
+      replyToResults.push({ label: c.label, expect: c.expect, status, mail: mailbox.slice(before), invited });
+      links.push(created.url);
+    }
   } finally {
     Object.assign(console, realConsole);
     for (const k of Object.keys(MAIL_ENV)) {
@@ -1001,6 +1027,16 @@ async function inviteEmailChecks(
   check("the escaped email still links to the invite; plain text has the link and the name as typed",
     Boolean(xss) && xh.includes(`<a href="${esc(xss!.url)}"`) && xssMail[0]?.body.text.includes(xss!.url) === true &&
       xssMail[0]?.body.text.includes(`<script>alert(1)</script>`) === true);
+  for (const r of replyToResults) {
+    const body = r.mail[0]?.body;
+    check(`EMAIL_REPLY_TO ${r.label}: invite created and emailed, ${r.expect ? "with" : "without"} a Reply-To`,
+      r.invited && r.status === "sent" && r.mail.length === 1 && body?.from === MAIL_ENV.EMAIL_FROM_ADDRESS &&
+        (r.expect ? body.reply_to === r.expect : !("reply_to" in body)) && typeof body.html === "string" && body.text.length > 0,
+      `${r.status}, ${r.mail.length} sent`);
+  }
+  check("in-process log says only whether a Reply-To was attached",
+    captured.filter((l) => l === "[invite-email] sent (reply-to attached)").length >= 2 &&
+      captured.filter((l) => l === "[invite-email] sent (no reply-to)").length >= 3 + badReplyTo.length);
   const fallback = renderToStaticMarkup(createElement(InviteLink, { label: "Invite link", email: teamEmail, url: links[0], emailStatus: "not_configured" }));
   check("not configured: the result shows the link only, as before (no email message)",
     fallback.includes(links[0]) && !fallback.includes("Email sent") && !/Email couldn/.test(fallback));
@@ -1008,11 +1044,15 @@ async function inviteEmailChecks(
   // Logs: only success/failure and the provider's error code.
   const serverLog = existsSync(SERVER_LOG) ? readFileSync(SERVER_LOG, "utf8") : "";
   check("server log captured, with send results and the provider's error code",
-    serverLog.includes("[invite-email] sent") && serverLog.includes("[invite-email] send failed: validation_error") &&
+    serverLog.includes("[invite-email] sent (reply-to attached)") && serverLog.includes("[invite-email] send failed: validation_error") &&
       serverLog.includes("[invite-email] not sent: rate_limited"),
     serverLog ? "" : `no log at ${SERVER_LOG}; start the app with npm run e2e:server`);
   const secrets = [
     MAIL_ENV.RESEND_API_KEY,
+    MAIL_ENV.EMAIL_REPLY_TO,
+    ...badReplyTo,
+    `rt-${tag}`,
+    "e2e.example.test",
     ...links,
     ...links.map((l) => l.split("/invite/")[1]),
     "in-process-token",
@@ -1026,7 +1066,7 @@ async function inviteEmailChecks(
     failEmail,
   ].filter(Boolean);
   const leaked = (text: string) => secrets.filter((s) => text.includes(s)).length;
-  check("no API key, invite link, token, email body or recipient in the server log", Boolean(serverLog) && leaked(serverLog) === 0, `${leaked(serverLog)} leaked`);
+  check("no API key, Reply-To address, invite link, token, email body or recipient in the server log", Boolean(serverLog) && leaked(serverLog) === 0, `${leaked(serverLog)} leaked`);
   check("in-process sends log only the result", captured.length > 0 && leaked(captured.join("\n")) === 0 && captured.every((l) => l.startsWith("[invite-email]")),
     `${captured.length} lines`);
 }

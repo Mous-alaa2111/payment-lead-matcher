@@ -7,6 +7,7 @@ export const MAIL_MOCK_PORT = 4010;
 export const MAIL_ENV = {
   RESEND_API_KEY: "re_e2e_fake_key_7f3a9c", // fake; the suite checks it never shows up in the server log
   EMAIL_FROM_ADDRESS: "E2E Invites <invites@e2e.example.test>",
+  EMAIL_REPLY_TO: "replies@e2e.example.test", // fake; must never show up in the server log either
   RESEND_API_URL: `http://localhost:${MAIL_MOCK_PORT}`,
 };
 // `next start` output, so the suite can check nothing secret was logged.

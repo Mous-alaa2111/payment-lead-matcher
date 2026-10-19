@@ -10,9 +10,12 @@ export { AGENCY_NAME };
 // without either, nothing is sent and the page shows the invite link only.
 // The invite is always created first: sending never throws or blocks it.
 // The message (HTML plus a plain-text version) is built in invite-email-content.ts.
+// Optional EMAIL_REPLY_TO (one plain address, e.g. `team@…`) becomes the Reply-To;
+// if it's missing, empty or not a valid address the email goes out without one.
 //
-// Logs say only whether sending worked and the provider's error code: never
-// the link, the email body, the recipient or the key.
+// Logs say only whether sending worked, the provider's error code and whether a
+// Reply-To was attached: never the link, the email body, the recipient, the
+// Reply-To address or the key.
 
 // Per inviting user, rolling hour, counted from the invitations they created.
 export const INVITE_EMAILS_PER_HOUR = 20;
@@ -25,7 +28,25 @@ function settings() {
   const from = process.env.EMAIL_FROM_ADDRESS?.trim();
   if (!apiKey || !from) return null;
   // RESEND_API_URL exists only so the e2e suite can point at its mock.
-  return { apiKey, from, apiUrl: process.env.RESEND_API_URL?.trim() || "https://api.resend.com" };
+  return {
+    apiKey,
+    from,
+    replyTo: replyToAddress(process.env.EMAIL_REPLY_TO),
+    apiUrl: process.env.RESEND_API_URL?.trim() || "https://api.resend.com",
+  };
+}
+
+// local@domain.tld: dot-separated atoms (no quoting, display names or lists), a
+// hostname of letters, digits and inner hyphens, and a letters-only TLD.
+const ATOM = "[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+";
+const LABEL = "[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?";
+const REPLY_TO_ADDRESS = new RegExp(`^${ATOM}(?:\\.${ATOM})*@(?:${LABEL}\\.)+[A-Za-z]{2,}$`);
+
+// The EMAIL_REPLY_TO setting if it's a single plain email address, else undefined (no Reply-To).
+export function replyToAddress(setting: string | undefined) {
+  const value = setting?.trim();
+  if (!value || value.length > 254) return undefined;
+  return REPLY_TO_ADDRESS.test(value) ? value : undefined;
 }
 
 async function overHourlyLimit(userId: string) {
@@ -68,7 +89,14 @@ export async function sendInviteEmail(opts: {
     const res = await fetch(`${config.apiUrl}/emails`, {
       method: "POST",
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: config.from, to: [invite.email], subject, html, text }),
+      body: JSON.stringify({
+        from: config.from,
+        to: [invite.email],
+        ...(config.replyTo && { reply_to: config.replyTo }),
+        subject,
+        html,
+        text,
+      }),
       signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     });
     if (!res.ok) {
@@ -78,7 +106,7 @@ export async function sendInviteEmail(opts: {
       console.error(`[invite-email] send failed: ${code}`);
       return "failed";
     }
-    console.log("[invite-email] sent");
+    console.log(`[invite-email] sent (${config.replyTo ? "reply-to attached" : "no reply-to"})`);
     return "sent";
   } catch (err) {
     const name = err instanceof Error ? err.name : "unknown";
