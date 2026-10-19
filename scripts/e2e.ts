@@ -824,7 +824,7 @@ async function memberRemovalChecks(
 
 // Mock of Resend's POST /emails. Records every request; a recipient containing
 // "fail-email" gets a 422 whose message repeats the address (it must not be logged).
-type MailRequest = { path: string; auth: string; body: { from: string; to: string[]; subject: string; text: string } };
+type MailRequest = { path: string; auth: string; body: { from: string; to: string[]; subject: string; text: string; html?: string } };
 const mailbox: MailRequest[] = [];
 async function startMailMock() {
   const { createServer } = await import("node:http");
@@ -861,7 +861,9 @@ async function inviteEmailChecks(
   const { invitations } = await import("../src/db/schema");
   const { sha256 } = await import("../src/lib/crypto");
   const { createInvitation } = await import("../src/lib/invitations");
+  const { clients } = await import("../src/db/schema");
   const { AGENCY_NAME, INVITE_EMAILS_PER_HOUR, sendInviteEmail } = await import("../src/lib/invite-email");
+  const { esc } = await import("../src/lib/invite-email-content");
   const { InviteLink } = await import("../src/components/invite-link");
   const { MAIL_ENV, SERVER_LOG } = await import("./e2e-mail");
   const { owner, admin, staff } = actors;
@@ -895,6 +897,16 @@ async function inviteEmailChecks(
       m.body.text.includes("Role: admin") && Boolean(res.link) && m.body.text.includes(res.link) &&
       /expires on \w+ \d{1,2}, \d{4}/.test(m.body.text),
     m?.body.subject);
+  check("Team email is sent as HTML and plain text in one message",
+    typeof m?.body.html === "string" && m.body.html.startsWith("<!DOCTYPE html>") && m.body.text.length > 0 && !m.body.text.includes("<"));
+  check("Team email HTML: Accept invitation button to the link, the link as text, escaped names, role, expiry, logo",
+    Boolean(res.link) && m?.body.html?.includes(`<a href="${esc(res.link)}"`) === true && m.body.html.includes(">Accept invitation</a>") &&
+      m.body.html.split(esc(res.link)).length === 3 && m.body.html.includes(`<strong style="color:#18181b;">${esc(client.name)}</strong>`) &&
+      m.body.html.includes(">E2E</strong> invited you to join") && m.body.html.includes("as an admin.") &&
+      /expires on <strong[^>]*>\w+ \d{1,2}, \d{4}/.test(m.body.html) && m.body.html.includes('alt="Elko Creative"') &&
+      m.body.html.includes(`Accept your invite to ${esc(client.name)}`));
+  check("Team email HTML has no tracking pixel, script or external CSS: one image (the logo), one link (the invite)",
+    m?.body.html?.match(/<img /g)?.length === 1 && m.body.html.match(/<a /g)?.length === 1 && !/<script|<link|<style/i.test(m.body.html));
   check("Team form: page says Email sent and still shows the link",
     res.html.includes(`Email sent to <strong>${teamEmail}</strong>`) && Boolean(res.link));
   check("emailed link is the stored invite's link", Boolean(res.row) && res.row.tokenHash === tokenHashOf(res.link));
@@ -907,6 +919,9 @@ async function inviteEmailChecks(
   check("Agency email: subject names the agency; body has role and link",
     m?.body.subject === `You're invited to ${AGENCY_NAME}` && m.body.text.includes("Role: agency staff") && m.body.text.includes(res.link),
     m?.body.subject);
+  check("Agency email HTML: button to the link, agency name, role in plain words",
+    Boolean(res.link) && m?.body.html?.includes(`<a href="${esc(res.link)}"`) === true && m.body.html.includes(`>${AGENCY_NAME}</strong>`) &&
+      m.body.html.includes("as agency staff, with access to every client."));
   check("Agency form: page says Email sent and still shows the link",
     res.html.includes(`Email sent to <strong>${staffEmail}</strong>`) && Boolean(res.link) && res.row?.tokenHash === tokenHashOf(res.link));
 
@@ -951,11 +966,21 @@ async function inviteEmailChecks(
   };
   const url = MAIL_ENV.RESEND_API_URL;
   const results: Awaited<ReturnType<typeof sendWith>>[] = [];
+  let xss: Awaited<ReturnType<typeof createInvitation>> | undefined;
+  let xssStatus = "";
+  let xssMail: MailRequest[] = [];
   try {
     results.push(await sendWith({ EMAIL_FROM_ADDRESS: MAIL_ENV.EMAIL_FROM_ADDRESS, RESEND_API_URL: url }));
     results.push(await sendWith({ RESEND_API_KEY: MAIL_ENV.RESEND_API_KEY, RESEND_API_URL: url }));
     results.push(await sendWith({ RESEND_API_URL: url }));
     results.push(await sendWith(MAIL_ENV));
+    // A client and inviter name carrying HTML (settings still MAIL_ENV): it must come out escaped.
+    const [xssClient] = await db.insert(clients)
+      .values({ name: `E2E <script>alert(1)</script> & "Co" ${tag}`, slug: `${tag}-xss` }).returning();
+    xss = await createInvitation({ email: `${tag}-mail-xss@example.com`, clientId: xssClient.id, role: "viewer", invitedBy: null });
+    const n = mailbox.length;
+    xssStatus = await sendInviteEmail({ invite: xss.invite, url: xss.url, inviter: { id: owner.userId, name: `O'Neil <b>Boss</b>`, email: "x@example.com" } });
+    xssMail = mailbox.slice(n);
   } finally {
     Object.assign(console, realConsole);
     for (const k of Object.keys(MAIL_ENV)) {
@@ -968,6 +993,14 @@ async function inviteEmailChecks(
   check("missing EMAIL_FROM_ADDRESS: nothing sent", noFrom.status === "not_configured" && noFrom.sent === 0, noFrom.status);
   check("neither set: nothing sent", neither.status === "not_configured" && neither.sent === 0, neither.status);
   check("both set: the same call sends", both.status === "sent" && both.sent === 1, both.status);
+  const xh = xssMail[0]?.body.html ?? "";
+  check("a client name with <script> is escaped in the HTML, with the inviter's name",
+    xssStatus === "sent" && xssMail.length === 1 && !xh.includes("<script") && !xh.includes("<b>Boss") &&
+      xh.includes(`E2E &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;Co&quot; ${tag}`) && xh.includes("O&#39;Neil &lt;b&gt;Boss&lt;/b&gt;"),
+    xssStatus);
+  check("the escaped email still links to the invite; plain text has the link and the name as typed",
+    Boolean(xss) && xh.includes(`<a href="${esc(xss!.url)}"`) && xssMail[0]?.body.text.includes(xss!.url) === true &&
+      xssMail[0]?.body.text.includes(`<script>alert(1)</script>`) === true);
   const fallback = renderToStaticMarkup(createElement(InviteLink, { label: "Invite link", email: teamEmail, url: links[0], emailStatus: "not_configured" }));
   check("not configured: the result shows the link only, as before (no email message)",
     fallback.includes(links[0]) && !fallback.includes("Email sent") && !/Email couldn/.test(fallback));
@@ -983,7 +1016,12 @@ async function inviteEmailChecks(
     ...links,
     ...links.map((l) => l.split("/invite/")[1]),
     "in-process-token",
+    ...(xss ? [xss.url, xss.url.split("/invite/")[1]] : []),
     "invited you to",
+    "You've been invited",
+    "Accept invitation",
+    "<!DOCTYPE",
+    "alert(1)",
     "Invalid recipient",
     failEmail,
   ].filter(Boolean);
@@ -1359,7 +1397,7 @@ async function main() {
     await cleanup("invitations", () => db.delete(invitations).where(like(invitations.email, `${tag}-%`)));
     await cleanup("clients", () =>
       db.delete(clients).where(
-        inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`, `${tag}-stripe`, `${tag}-remove`, `${tag}-members`, `${tag}-members-other`]),
+        inArray(clients.slug, [tag, `${tag}-other`, `${tag}-sync`, `${tag}-new`, `${tag}-stripe`, `${tag}-remove`, `${tag}-members`, `${tag}-members-other`, `${tag}-xss`]),
       ),
     );
     await cleanup("auto sync clients", () => db.delete(clients).where(like(clients.slug, `${tag}-auto-%`)));

@@ -1,16 +1,19 @@
 import { and, count, eq, gt } from "drizzle-orm";
 import { db } from "@/db";
 import { clients, invitations } from "@/db/schema";
+import { AGENCY_NAME, AGENCY_STAFF_ROLE, inviteEmailContent } from "@/lib/invite-email-content";
+
+export { AGENCY_NAME };
 
 // Invite emails, sent through Resend's HTTP API. Needs RESEND_API_KEY and
 // EMAIL_FROM_ADDRESS (a full from address, e.g. `Elko Creative <invites@…>`);
 // without either, nothing is sent and the page shows the invite link only.
 // The invite is always created first: sending never throws or blocks it.
+// The message (HTML plus a plain-text version) is built in invite-email-content.ts.
 //
 // Logs say only whether sending worked and the provider's error code: never
 // the link, the email body, the recipient or the key.
 
-export const AGENCY_NAME = "Elko Creative";
 // Per inviting user, rolling hour, counted from the invitations they created.
 export const INVITE_EMAILS_PER_HOUR = 20;
 const SEND_TIMEOUT_MS = 10_000;
@@ -23,25 +26,6 @@ function settings() {
   if (!apiKey || !from) return null;
   // RESEND_API_URL exists only so the e2e suite can point at its mock.
   return { apiKey, from, apiUrl: process.env.RESEND_API_URL?.trim() || "https://api.resend.com" };
-}
-
-const formatExpiry = (d: Date) =>
-  `${d.toLocaleString("en-US", { dateStyle: "long", timeStyle: "short", timeZone: "UTC" })} UTC`;
-
-export function inviteEmailContent(opts: { inviter: string; target: string; role: string; url: string; expiresAt: Date }) {
-  return {
-    subject: `You're invited to ${opts.target}`,
-    text: [
-      `${opts.inviter} invited you to ${opts.target} on Payment Lead Matcher.`,
-      `Role: ${opts.role}`,
-      "",
-      "Accept the invite here:",
-      opts.url,
-      "",
-      `This link expires on ${formatExpiry(opts.expiresAt)}.`,
-      "If you weren't expecting this, you can ignore this email.",
-    ].join("\n"),
-  };
 }
 
 async function overHourlyLimit(userId: string) {
@@ -73,10 +57,10 @@ export async function sendInviteEmail(opts: {
       const [client] = await db.select({ name: clients.name }).from(clients).where(eq(clients.id, invite.clientId));
       if (client) target = client.name;
     }
-    const { subject, text } = inviteEmailContent({
+    const { subject, text, html } = inviteEmailContent({
       inviter: opts.inviter.name || opts.inviter.email,
       target,
-      role: invite.agencyStaff ? "agency staff (access to every client)" : invite.role,
+      role: invite.agencyStaff ? AGENCY_STAFF_ROLE : invite.role,
       url: opts.url,
       expiresAt: invite.expiresAt,
     });
@@ -84,7 +68,7 @@ export async function sendInviteEmail(opts: {
     const res = await fetch(`${config.apiUrl}/emails`, {
       method: "POST",
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: config.from, to: [invite.email], subject, text }),
+      body: JSON.stringify({ from: config.from, to: [invite.email], subject, html, text }),
       signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     });
     if (!res.ok) {
