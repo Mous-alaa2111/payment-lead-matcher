@@ -9,7 +9,7 @@ import { squareConfigured } from "@/lib/connect/square";
 import { stripeConfigured } from "@/lib/connect/stripe";
 import { canManageInviteRole } from "@/lib/invitations";
 import { PROVIDER_NAME } from "@/lib/sync";
-import { autoSyncBlocker, nextAutoSync } from "@/lib/sync/schedule";
+import { autoSyncBlocker, nextAutoSync, syncEveryDays } from "@/lib/sync/schedule";
 import { formatDay, parseRange } from "@/lib/sync/window";
 import { disconnectAction, revokeInviteAction, syncAction, syncRangeAction } from "./actions";
 import { ClientStatusSelect } from "@/components/client-status-select";
@@ -17,6 +17,7 @@ import { SubmitButton } from "@/components/submit-button";
 import { InviteForm } from "./invite-form";
 import { RemoveClient } from "./remove-client";
 import { RemoveMember } from "./remove-member";
+import { WritebackSection } from "./writeback-section";
 
 // Server Actions on this page (Sync now, date-range backfills) may run long.
 export const maxDuration = 300;
@@ -112,7 +113,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
   const today = formatDay(new Date());
   // Daily auto sync (lib/sync/auto): same sync as Sync now, run by Vercel Cron.
   const autoBlocker = autoSyncBlocker(client, connections);
-  const autoNext = autoBlocker ? null : nextAutoSync(connections);
+  const autoNext = autoBlocker ? null : nextAutoSync(connections, new Date(), syncEveryDays(client.writebackMode));
 
   // Summary counts cover every stored payment in view; the table shows one page of them.
   const counts = { matched: 0, ambiguous: 0, no_match: 0 };
@@ -169,6 +170,7 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
       ? `${syncDone} for ${range.from} to ${range.to} (UTC).${partial}`
       : `${syncDone}${search.since ? ` since ${search.since}` : ""}.${partial}`
     : Object.entries(search)
+    .filter(([k]) => k !== "wb" && k !== "wbsetup") // write-back messages show in its own section
     .map(([k, v]) => MESSAGES[`${k}=${v}`] ?? (k === "error" ? `Something went wrong (${v}).` : null))
     .find(Boolean);
 
@@ -471,6 +473,11 @@ export default async function ClientPage(props: PageProps<"/dashboard/clients/[c
         </ul>
         {manage && <InviteForm clientId={clientId} canInviteOwner={role === "owner"} />}
       </section>
+
+      {/* Staff only: the section, its data and its actions never reach client members. */}
+      {membership.agency && (
+        <WritebackSection client={client} message={str(search.wb) || null} editSetup={search.wbsetup === "1"} />
+      )}
 
       {membership.agency && (
         <section className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-red-300/60 bg-panel p-5 shadow-sm dark:border-red-900/60">

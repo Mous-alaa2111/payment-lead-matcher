@@ -1,10 +1,10 @@
 import type { Contact } from "@/lib/matching";
+import { ghlBaseUrl } from "@/lib/ghl-url";
 
 // Read-only GHL contacts listing for one location, using that location's
 // Private Integration Token. Same endpoint and cursor paging as
 // stripe-crm-sync's ghl_client.list_contacts().
 
-const BASE_URL = "https://services.leadconnectorhq.com";
 const CONTACTS_VERSION = "2021-07-28";
 const PAGE_SIZE = 100; // GHL's max
 
@@ -21,7 +21,7 @@ export async function listGhlContacts(locationId: string, token: string): Promis
   let cursor: { startAfter: string; startAfterId: string } | null = null;
 
   for (;;) {
-    const url = new URL("/contacts/", BASE_URL);
+    const url = new URL("/contacts/", ghlBaseUrl());
     url.searchParams.set("locationId", locationId);
     url.searchParams.set("limit", String(PAGE_SIZE));
     if (cursor) {

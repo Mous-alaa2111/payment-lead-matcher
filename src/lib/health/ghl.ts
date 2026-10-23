@@ -1,10 +1,10 @@
 import { createdAtMs, type Opportunity } from "./rules";
+import { ghlBaseUrl } from "@/lib/ghl-url";
 
 // Read-only GHL opportunities for one location, using that location's Private
 // Integration Token. Same endpoints and paging as the GHL CLI's
 // weekly_report.py get_stage_map() / get_opportunities().
 
-const BASE_URL = "https://services.leadconnectorhq.com";
 const VERSION = "2021-07-28";
 const PAGE_SIZE = 100;
 
@@ -13,7 +13,7 @@ const PAGE_SIZE = 100;
 export class GhlAccessError extends Error {}
 
 async function get<T>(path: string, params: Record<string, string>, token: string): Promise<T> {
-  const url = new URL(path, BASE_URL);
+  const url = new URL(path, ghlBaseUrl());
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json", Version: VERSION },

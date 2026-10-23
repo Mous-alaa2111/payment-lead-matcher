@@ -5,10 +5,11 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { db } from "@/db";
 import { agencyStaff, clients, user } from "@/db/schema";
-import { requireAgencyStaff } from "@/lib/access";
+import { requireAgencyStaff, requireAgencyStaffOr404 } from "@/lib/access";
 import { encrypt } from "@/lib/crypto";
 import { sendInviteEmail, type InviteEmailStatus } from "@/lib/invite-email";
 import { createInvitation, normalizeEmail, revokeStaffInvitation } from "@/lib/invitations";
+import { setWritebackEnabled } from "@/lib/writeback/run";
 
 // Everything here is agency-only: each action checks requireAgencyStaff itself,
 // since Server Actions can be called directly, not just from the dashboard form.
@@ -77,5 +78,15 @@ export async function removeStaffAction(form: FormData) {
 export async function revokeStaffInviteAction(form: FormData) {
   await requireAgencyStaff();
   await revokeStaffInvitation(String(form.get("inviteId") ?? ""));
+  revalidatePath("/dashboard");
+}
+
+// The GHL write-back kill switch, for every client at once. Off stops all
+// write-back runs before their next write; Undo still works. 404 for non-staff.
+export async function setWritebackSwitchAction(form: FormData) {
+  const session = await requireAgencyStaffOr404();
+  const value = form.get("enabled");
+  if (value !== "true" && value !== "false") throw new Error("Bad value");
+  await setWritebackEnabled(value === "true", session.user.id);
   revalidatePath("/dashboard");
 }

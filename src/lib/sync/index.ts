@@ -68,12 +68,25 @@ type FetchedPayment = {
   displayName: string | null; // payer name shown in the table
 };
 
-async function fetchSquare(conn: Conn, window: SyncWindow): Promise<FetchedPayment[]> {
+// API clients for a stored connection, shared by sync and write-back's refund re-check.
+export function squareApiFor(conn: Conn) {
   if (!conn.accessTokenEnc) throw new Error("Square isn't connected for this client");
   if (conn.tokenExpiresAt && conn.tokenExpiresAt < new Date()) {
     throw new Error("Square access token has expired. Reconnect Square");
   }
-  const square = new SquareApi(decrypt(conn.accessTokenEnc), conn.livemode);
+  return new SquareApi(decrypt(conn.accessTokenEnc), conn.livemode);
+}
+
+export function stripeApiFor(conn: Conn) {
+  // A manually seeded connection stores the account's own key; a Connect
+  // account is read with the platform key plus the Stripe-Account header.
+  if (conn.accessTokenEnc) return new StripeApi(decrypt(conn.accessTokenEnc), null);
+  if (process.env.STRIPE_SECRET_KEY) return new StripeApi(process.env.STRIPE_SECRET_KEY, conn.externalAccountId);
+  throw new Error("Stripe isn't configured on the server (STRIPE_SECRET_KEY)");
+}
+
+async function fetchSquare(conn: Conn, window: SyncWindow): Promise<FetchedPayment[]> {
+  const square = squareApiFor(conn);
   const payments = await square.payments(window.start, window.end);
   const customers = await square.customers([
     ...new Set(payments.map((p) => p.customer_id).filter((id): id is string => Boolean(id))),
@@ -93,13 +106,7 @@ async function fetchSquare(conn: Conn, window: SyncWindow): Promise<FetchedPayme
 }
 
 async function fetchStripe(conn: Conn, window: SyncWindow): Promise<FetchedPayment[]> {
-  // A manually seeded connection stores the account's own key; a Connect
-  // account is read with the platform key plus the Stripe-Account header.
-  let stripe: StripeApi;
-  if (conn.accessTokenEnc) stripe = new StripeApi(decrypt(conn.accessTokenEnc), null);
-  else if (process.env.STRIPE_SECRET_KEY) stripe = new StripeApi(process.env.STRIPE_SECRET_KEY, conn.externalAccountId);
-  else throw new Error("Stripe isn't configured on the server (STRIPE_SECRET_KEY)");
-
+  const stripe = stripeApiFor(conn);
   const charges = await stripe.charges(window.start, window.end);
   return charges.map((c) => {
     // A deleted customer comes back as { id, deleted: true }: treat it as no customer.

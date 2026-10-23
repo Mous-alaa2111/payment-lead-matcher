@@ -12,6 +12,7 @@ export type SquarePayment = {
   customer_id?: string | null;
   buyer_email_address?: string | null;
   amount_money?: { amount?: number; currency?: string };
+  refunded_money?: { amount?: number; currency?: string };
 };
 
 export type SquareCustomer = {
@@ -24,6 +25,11 @@ export type SquareCustomer = {
 const PAGE_LIMIT = 100; // ListPayments max
 const BULK_CUSTOMERS = 100; // BulkRetrieveCustomers max
 
+// Square answers too many requests with 429 RATE_LIMITED (it publishes no fixed
+// limit). Each call is retried after 1 s, 2 s, 4 s, then the error is thrown.
+// Tests shrink baseMs.
+export const SQUARE_RETRY = { attempts: 4, baseMs: 1000 };
+
 export class SquareApi {
   constructor(
     private token: string,
@@ -33,17 +39,22 @@ export class SquareApi {
   private async call<T>(path: string, init: { params?: Record<string, string>; body?: object } = {}) {
     const url = new URL(path, this.livemode ? "https://connect.squareup.com" : "https://connect.squareupsandbox.com");
     for (const [k, v] of Object.entries(init.params ?? {})) url.searchParams.set(k, v);
-    const res = await fetch(url, {
-      method: init.body ? "POST" : "GET",
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        "Square-Version": SQUARE_VERSION,
-        Accept: "application/json",
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: init.body ? JSON.stringify(init.body) : undefined,
-      cache: "no-store",
-    });
+    let res: Response;
+    for (let attempt = 1; ; attempt++) {
+      res = await fetch(url, {
+        method: init.body ? "POST" : "GET",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Square-Version": SQUARE_VERSION,
+          Accept: "application/json",
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+        },
+        body: init.body ? JSON.stringify(init.body) : undefined,
+        cache: "no-store",
+      });
+      if (res.status !== 429 || attempt >= SQUARE_RETRY.attempts) break;
+      await new Promise((r) => setTimeout(r, SQUARE_RETRY.baseMs * 2 ** (attempt - 1)));
+    }
     const body = await res.json();
     if (!res.ok) {
       const detail = body.errors?.map((e: { code: string; detail?: string }) => e.detail ?? e.code).join("; ");
@@ -98,5 +109,11 @@ export class SquareApi {
       for (const id of chunk) found.set(id, body.responses?.[id]?.customer ?? null);
     }
     return found;
+  }
+
+  // One payment, for write-back's refund re-check (status and refunded_money).
+  async payment(id: string) {
+    const body = await this.call<{ payment: SquarePayment }>(`/v2/payments/${encodeURIComponent(id)}`);
+    return body.payment;
   }
 }

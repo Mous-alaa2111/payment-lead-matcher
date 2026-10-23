@@ -48,6 +48,16 @@ async function main() {
         `${s.noMatch} no match; ${s.rematched} older rows re-matched`,
     );
   }
+  if (!values.provider) {
+    // Same as Sync now: GHL write-back runs for clients in Preview or Auto.
+    const { writeBackAfterSync } = await import("../src/lib/writeback/run");
+    const { sendWritebackSummary } = await import("../src/lib/writeback/email");
+    const wb = await writeBackAfterSync(client.id, results, { trigger: "sync" });
+    if (wb) {
+      console.log(`write-back: ${wb.status}, ${wb.planned} planned, ${wb.updated} updated${wb.error ? `: ${wb.error}` : ""}`);
+      await sendWritebackSummary([wb], "sync CLI");
+    }
+  }
   console.log(`(${((Date.now() - started) / 1000).toFixed(1)}s)`);
 }
 

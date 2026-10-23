@@ -9,6 +9,12 @@ import { parse } from "dotenv";
 
 const TEST_ENV = ".env.test.local";
 
+// GHL (and, for write-back's refund re-check, Stripe) go to the suite's mock
+// (scripts/e2e.ts), never the real services. Selecting the e2e database also
+// sets E2E_NO_REAL_GHL, so lib/ghl-url throws rather than reach real GHL.
+export const PROVIDER_MOCK_PORT = 4020;
+export const PROVIDER_MOCK_URL = `http://localhost:${PROVIDER_MOCK_PORT}`;
+
 const endpoint = (url: string) => new URL(url).hostname.replace("-pooler", "");
 
 export function selectE2EDatabase() {
@@ -22,6 +28,8 @@ export function selectE2EDatabase() {
     throw new Error(`${TEST_ENV} points at the same Neon endpoint as .env.local. Refusing to run against production data.`);
   }
   process.env.DATABASE_URL = testUrl;
+  process.env.E2E_NO_REAL_GHL = "1";
+  process.env.GHL_API_URL = PROVIDER_MOCK_URL;
   return endpoint(testUrl);
 }
 

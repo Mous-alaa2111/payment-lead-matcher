@@ -23,7 +23,8 @@ const SEND_TIMEOUT_MS = 10_000;
 
 export type InviteEmailStatus = "sent" | "failed" | "rate_limited" | "not_configured";
 
-function settings() {
+// Also used by the write-back summary email (lib/writeback/email).
+export function resendSettings() {
   const apiKey = process.env.RESEND_API_KEY?.trim();
   const from = process.env.EMAIL_FROM_ADDRESS?.trim();
   if (!apiKey || !from) return null;
@@ -65,7 +66,7 @@ export async function sendInviteEmail(opts: {
   inviter: { id: string; name: string; email: string };
 }): Promise<InviteEmailStatus> {
   try {
-    const config = settings();
+    const config = resendSettings();
     if (!config) return "not_configured";
     if (await overHourlyLimit(opts.inviter.id)) {
       console.warn("[invite-email] not sent: rate_limited");

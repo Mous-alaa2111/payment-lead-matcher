@@ -11,6 +11,11 @@ const DAY = 86_400_000;
 
 // How often each client is auto synced. Change this one number to change it.
 export const AUTO_SYNC_EVERY_DAYS = 14;
+// Clients whose GHL write-back is on Auto are synced (and written back) daily.
+export const WRITEBACK_AUTO_SYNC_EVERY_DAYS = 1;
+
+export const syncEveryDays = (writebackMode: string) =>
+  writebackMode === "auto" ? WRITEBACK_AUTO_SYNC_EVERY_DAYS : AUTO_SYNC_EVERY_DAYS;
 
 // Must match the schedule in vercel.json ("0 6 * * *"; a unit test checks it).
 // On the Hobby plan Vercel fires a daily cron somewhere within that hour.

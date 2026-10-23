@@ -17,6 +17,8 @@
     "sync": "tsx scripts/sync.ts",
     "seed:manual-square": "tsx scripts/seed-manual-square.ts",
     "set:client-statuses": "tsx scripts/set-client-statuses.ts",
+    "writeback:setup": "tsx scripts/writeback-setup.ts",
+    "writeback:import-log": "tsx scripts/writeback-import-log.ts",
     "test:e2e": "tsx scripts/e2e.ts",
     "preview:invite-email": "tsx scripts/preview-invite-email.ts",
     "e2e:server": "tsx scripts/e2e-server.ts",

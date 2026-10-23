@@ -1,4 +1,4 @@
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import {
   boolean,
   date,
@@ -23,6 +23,23 @@ export * from "./auth-schema";
 // the Client Health page shows active and onboarding clients by default.
 export const clientStatus = pgEnum("client_status", ["active", "onboarding", "paused", "canceled"]);
 
+// GHL write-back (lib/writeback), set per client by agency staff. off = nothing;
+// preview = plan after each sync, write nothing until staff press Apply;
+// auto = plan and write after each sync.
+export const writebackMode = pgEnum("writeback_mode", ["off", "preview", "auto"]);
+
+// Which of the client's GHL pipelines write-back works in, picked by staff from
+// the live pipelines. An opportunity is closed in its own pipeline's closedStageId;
+// a contact carrying one of contradictTags (lowercased) is skipped for that pipeline.
+export type WritebackPipeline = {
+  id: string;
+  name: string;
+  closedStageId: string;
+  closedStageName: string;
+  contradictTags: string[];
+};
+export type WritebackConfig = { pipelines: WritebackPipeline[] };
+
 // A client is a business whose payments we match to leads (one per GHL
 // location). Stripe/Square connections and transactions will hang off this.
 export const clients = pgTable("clients", {
@@ -37,6 +54,12 @@ export const clients = pgTable("clients", {
   // as for Sync now; this holds only a failure outside them.
   lastAutoSyncAt: timestamp("last_auto_sync_at", { withTimezone: true }),
   lastAutoSyncError: text("last_auto_sync_error"),
+  writebackMode: writebackMode("writeback_mode").notNull().default("off"),
+  writebackConfig: jsonb("writeback_config").$type<WritebackConfig>(),
+  // Last Check permissions result. Auto can only be chosen while it passed.
+  writebackPermsOk: boolean("writeback_perms_ok").notNull().default(false),
+  writebackPermsCheckedAt: timestamp("writeback_perms_checked_at", { withTimezone: true }),
+  writebackPermsDetail: text("writeback_perms_detail"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .defaultNow()
@@ -135,6 +158,7 @@ export const paymentConnections = pgTable(
 );
 
 export const matchStatus = pgEnum("match_status", ["matched", "ambiguous", "no_match"]);
+export const writebackPaymentState = pgEnum("writeback_payment_state", ["pushed", "blocked"]);
 export const matchMethod = pgEnum("match_method", ["email", "phone"]);
 
 export type MatchedContact = { id: string; name: string; email: string | null; phone: string | null };
@@ -162,6 +186,14 @@ export const paymentMatches = pgTable(
     method: matchMethod("method"),
     contacts: jsonb("contacts").$type<MatchedContact[]>().notNull().default([]),
     syncedAt: timestamp("synced_at", { withTimezone: true }).defaultNow().notNull(),
+    // Write-back (lib/writeback). Never touched by sync's upsert.
+    // refundedCents: as last re-checked with the provider; null = never checked.
+    refundedCents: integer("refunded_cents"),
+    refundCheckedAt: timestamp("refund_checked_at", { withTimezone: true }),
+    // null = not pushed; pushed = counted in a GHL update (writebackAuditId);
+    // blocked = that update was undone, held until staff press Release.
+    writebackState: writebackPaymentState("writeback_state"),
+    writebackAuditId: uuid("writeback_audit_id"),
   },
   (t) => [
     uniqueIndex("payment_matches_payment_idx").on(t.clientId, t.provider, t.externalPaymentId),
@@ -196,6 +228,118 @@ export const clientHealthStatus = pgTable("client_health_status", {
     .references(() => clients.id, { onDelete: "cascade" }),
   lastRefreshedAt: timestamp("last_refreshed_at", { withTimezone: true }).notNull(),
   lastError: text("last_error"),
+});
+
+// --- GHL write-back (lib/writeback) ---
+
+// An opportunity's pipeline, stage, status and value, with names for display.
+export type OpportunityState = {
+  pipelineId: string;
+  pipelineName: string;
+  pipelineStageId: string;
+  stageName: string;
+  status: string; // open / won / lost / abandoned
+  monetaryValue: number | null; // dollars, as GHL stores it
+};
+
+// One lead in a run's plan: the update it gets, or why it's skipped.
+export type WritebackPlanItem = {
+  contactId: string;
+  paymentIds: string[]; // payment_matches ids whose amounts make up totalCents
+  totalCents: number;
+  excluded: { paymentId: string; reason: string }[]; // the lead's payments left out, and why
+  opportunityId: string | null;
+  current: OpportunityState | null;
+  target: OpportunityState | null; // null when skipped
+  setValue: boolean; // false = value already equals totalCents, left as is
+  skip: string | null; // null = update
+  outcome?: "updated" | "skipped" | "error" | "not_reached"; // set when the plan is applied
+  note?: string;
+};
+
+export const writebackRunStatus = pgEnum("writeback_run_status", ["running", "ok", "capped", "error", "killed"]);
+export const writebackTrigger = pgEnum("writeback_trigger", ["sync", "cron", "run_now", "apply", "import"]);
+
+// One write-back run on one client. At most one runs per client at a time
+// (partial unique index); a run older than RUN_STALE_MS still "running" is
+// treated as interrupted.
+export const writebackRuns = pgTable(
+  "writeback_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    clientId: uuid("client_id")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    trigger: writebackTrigger("trigger").notNull(),
+    applied: boolean("applied").notNull(), // false = plan only (Preview)
+    status: writebackRunStatus("status").notNull().default("running"),
+    plan: jsonb("plan").$type<WritebackPlanItem[]>().notNull().default([]),
+    updated: integer("updated").notNull().default(0),
+    newNeedsReview: integer("new_needs_review").notNull().default(0),
+    error: text("error"),
+    startedBy: text("started_by").references(() => user.id, { onDelete: "set null" }),
+    startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("writeback_runs_client_idx").on(t.clientId, t.startedAt),
+    uniqueIndex("writeback_runs_one_running_idx").on(t.clientId).where(sql`status = 'running'`),
+  ],
+);
+
+export const writebackResult = pgEnum("writeback_result", ["pending", "ok", "error", "undone"]);
+export const writebackTagStatus = pgEnum("writeback_tag_status", ["added", "already", "failed"]);
+
+// Every GHL opportunity write-back: what it was before, what we set, and the
+// outcome. Undo restores the previous_* columns. A pending or ok row holds its
+// opportunity (partial unique index), so it can't be pushed twice.
+export const writebackAudit = pgTable(
+  "writeback_audit",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    clientId: uuid("client_id")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    runId: uuid("run_id").references(() => writebackRuns.id, { onDelete: "set null" }),
+    paymentIds: jsonb("payment_ids").$type<string[]>().notNull(), // payment_matches ids
+    contactId: text("contact_id").notNull(),
+    opportunityId: text("opportunity_id").notNull(),
+    previousPipelineId: text("previous_pipeline_id").notNull(),
+    previousPipelineName: text("previous_pipeline_name").notNull(),
+    previousStageId: text("previous_stage_id").notNull(),
+    previousStageName: text("previous_stage_name").notNull(),
+    previousStatus: text("previous_status").notNull(),
+    previousValue: jsonb("previous_value").$type<number | null>(), // dollars; null = no value
+    newPipelineId: text("new_pipeline_id").notNull(),
+    newStageId: text("new_stage_id").notNull(),
+    newStageName: text("new_stage_name").notNull(),
+    newStatus: text("new_status").notNull(),
+    newValue: jsonb("new_value").$type<number | null>(),
+    result: writebackResult("result").notNull().default("pending"),
+    error: text("error"),
+    tagStatus: writebackTagStatus("tag_status"),
+    needsReview: boolean("needs_review").notNull().default(false),
+    reviewReason: text("review_reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    undoneAt: timestamp("undone_at", { withTimezone: true }),
+    undoneBy: text("undone_by").references(() => user.id, { onDelete: "set null" }),
+    releasedAt: timestamp("released_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("writeback_audit_client_idx").on(t.clientId, t.createdAt),
+    uniqueIndex("writeback_audit_one_live_push_idx")
+      .on(t.clientId, t.opportunityId)
+      .where(sql`result in ('pending', 'ok')`),
+  ],
+);
+
+// App-wide switches. Row "writeback_enabled" ("true"/"false") is the kill switch;
+// a missing row means enabled. WRITEBACK_DISABLED=1 in the environment overrides it.
+export const appSettings = pgTable("app_settings", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+  updatedBy: text("updated_by").references(() => user.id, { onDelete: "set null" }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const clientsRelations = relations(clients, ({ many }) => ({

@@ -23,6 +23,8 @@ const check = (name: string, ok: boolean, extra = "") => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? `  (${extra})` : ""}`);
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// GHL calls go to GHL_API_URL (the suite's mock, set by selectE2EDatabase); in-process fakes match on it.
+const isGhl = (url: URL) => url.origin === new URL(process.env.GHL_API_URL!).origin;
 
 // Neon over HTTP drops a connection now and then (a timed-out fetch, not a SQL error).
 function isConnectionError(e: unknown) {
@@ -145,7 +147,7 @@ async function syncWindowChecks(clientId: string, owner: Jar, viewer: Jar) {
       const from = Number(url.searchParams.get("cursor") ?? 0);
       return json({ payments: inWindow.slice(from, from + 2), ...(from + 2 < inWindow.length ? { cursor: String(from + 2) } : {}) });
     }
-    if (url.hostname === "services.leadconnectorhq.com") return json({ contacts: ghl, meta: {} });
+    if (isGhl(url)) return json({ contacts: ghl, meta: {} });
     return realFetch(input, init);
   }) as typeof fetch;
 
@@ -303,7 +305,7 @@ async function stripeSyncChecks(tag: string, owner: Jar, ownerId: string) {
         ? json({ data: charges.slice(2), has_more: false })
         : json({ data: charges.slice(0, 2), has_more: true });
     }
-    if (url.hostname === "services.leadconnectorhq.com") return json({ contacts: ghl, meta: {} });
+    if (isGhl(url)) return json({ contacts: ghl, meta: {} });
     return realFetch(input, init);
   }) as typeof fetch;
 
@@ -391,7 +393,7 @@ async function autoSyncChecks(tag: string, owner: Jar, ownerId: string) {
         has_more: false,
       });
     }
-    if (url.hostname === "services.leadconnectorhq.com") return json({ contacts: [{ id: "g-auto", firstName: "Auto", email: "auto@example.com" }], meta: {} });
+    if (isGhl(url)) return json({ contacts: [{ id: "g-auto", firstName: "Auto", email: "auto@example.com" }], meta: {} });
     return realFetch(input, init);
   }) as typeof fetch;
 
@@ -512,7 +514,7 @@ async function healthChecks(tag: string, clientUsers: ClientUser[], staff: Jar, 
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    if (url.hostname !== "services.leadconnectorhq.com") return realFetch(input, init);
+    if (!isGhl(url)) return realFetch(input, init);
     const loc = url.searchParams.get("locationId") ?? url.searchParams.get("location_id");
     if (loc === `${tag}-h-denied`) return new Response('{"message":"The token is not authorized for this scope."}', { status: 403 });
     if (url.pathname === "/opportunities/pipelines") {
@@ -822,6 +824,471 @@ async function memberRemovalChecks(
   check("remaining members untouched", (await isMember(owner.userId)) && (await isMember(admin.userId)));
 }
 
+// Mock of GHL (and Stripe's single-charge read, for write-back's refund re-check)
+// on PROVIDER_MOCK_URL. Both this process and the app on :3000 send GHL calls
+// here (GHL_API_URL), never to real GHL. Records every write; the token
+// "deny-write" is refused on writes like a token without write scopes.
+type MockOpp = {
+  id: string; pipelineId: string; pipelineStageId: string; status: string; monetaryValue: number | null; createdAt: string; contactId: string;
+};
+type MockCharge = { id: string; amount: number; currency: string; status: string; refunded: boolean; amount_refunded: number; created: number };
+const providerMock = {
+  pipelines: [] as { id: string; name: string; stages: { id: string; name: string }[] }[],
+  opps: new Map<string, MockOpp>(),
+  contacts: new Map<string, { id: string; email: string; tags: string[] }>(),
+  charges: new Map<string, MockCharge>(),
+  writes: [] as { method: string; path: string; body: Record<string, unknown> }[],
+  failPut: new Set<string>(),
+};
+async function startProviderMock() {
+  const { createServer } = await import("node:http");
+  const { PROVIDER_MOCK_PORT, PROVIDER_MOCK_URL } = await import("./e2e-db");
+  const m = providerMock;
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      const send = (status: number, body: object) => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(body));
+      };
+      const url = new URL(req.url ?? "/", PROVIDER_MOCK_URL);
+      const method = req.method ?? "GET";
+      const body = raw ? JSON.parse(raw) : {};
+      const write = method !== "GET";
+      if (write && req.headers.authorization === "Bearer deny-write") {
+        return send(401, { message: "The token is not authorized for this scope." });
+      }
+      let hit: RegExpMatchArray | null;
+      // Stripe
+      if (url.pathname === "/v1/charges") return send(200, { data: [], has_more: false });
+      if ((hit = url.pathname.match(/^\/v1\/charges\/([^/]+)$/))) {
+        const c = m.charges.get(decodeURIComponent(hit[1]));
+        return c ? send(200, c) : send(404, { error: { message: "No such charge" } });
+      }
+      // GHL
+      if (url.pathname === "/opportunities/pipelines") return send(200, { pipelines: m.pipelines });
+      if (url.pathname === "/contacts/") {
+        return send(200, { contacts: [...m.contacts.values()].map((c) => ({ id: c.id, firstName: "Lead", email: c.email })), meta: {} });
+      }
+      if (url.pathname === "/opportunities/search") {
+        const cid = url.searchParams.get("contact_id");
+        const list = [...m.opps.values()].filter((o) => !cid || o.contactId === cid);
+        return send(200, { opportunities: list, meta: { total: list.length } });
+      }
+      if ((hit = url.pathname.match(/^\/opportunities\/([^/]+)$/))) {
+        const o = m.opps.get(decodeURIComponent(hit[1]));
+        if (!o) return send(404, { statusCode: 404, message: "Opportunity not found" });
+        if (method === "GET") return send(200, { opportunity: o });
+        if (method === "PUT") {
+          if (m.failPut.has(o.id)) return send(500, { message: "mock failure" });
+          for (const k of ["pipelineId", "pipelineStageId", "status", "monetaryValue"] as const) {
+            if (k in body) (o as Record<string, unknown>)[k] = body[k];
+          }
+          m.writes.push({ method, path: url.pathname, body });
+          return send(200, { opportunity: o });
+        }
+      }
+      if ((hit = url.pathname.match(/^\/contacts\/([^/]+)\/tags$/))) {
+        const c = m.contacts.get(decodeURIComponent(hit[1]));
+        if (!c) return send(404, { message: "Contact not found" });
+        const tags: string[] = body.tags ?? [];
+        if (method === "POST") c.tags = [...new Set([...c.tags, ...tags])];
+        else if (method === "DELETE") c.tags = c.tags.filter((t) => !tags.includes(t));
+        m.writes.push({ method, path: url.pathname, body });
+        return send(200, { tags: c.tags });
+      }
+      if ((hit = url.pathname.match(/^\/contacts\/([^/]+)$/))) {
+        const c = m.contacts.get(decodeURIComponent(hit[1]));
+        return c ? send(200, { contact: c }) : send(404, { message: "Contact not found" });
+      }
+      send(404, { message: `mock: no route for ${method} ${url.pathname}` });
+    });
+  });
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(PROVIDER_MOCK_PORT, resolve));
+  server.unref();
+}
+
+// GHL write-back, against the mock only. Rules, Preview, Apply, Auto via the
+// cron, the caps, idempotency, refund flagging, the kill switch, undo/release,
+// stopping at the first error, and every staff-only control refused (404) for a
+// client's owner, admin and viewer, also when the request is built by hand.
+async function writebackChecks(
+  tag: string,
+  clientUsers: ClientUser[],
+  staff: { jar: Jar; userId: string; email: string },
+  formFields: (html: string, marker: string) => FormData,
+) {
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("../src/db");
+  const { clients, clientMembers, paymentConnections, paymentMatches, writebackAudit, writebackRuns } = await import("../src/db/schema");
+  const { encrypt } = await import("../src/lib/crypto");
+  const wb = await import("../src/lib/writeback/run");
+  const { checkPermissions, setMode } = await import("../src/lib/writeback/setup");
+  const { runAutoSync } = await import("../src/lib/sync/auto");
+  const { PROVIDER_MOCK_URL } = await import("./e2e-db");
+  const m = providerMock;
+
+  const DAY = 86_400_000;
+  const ago = (d: number) => new Date(Date.now() - d * DAY);
+  m.pipelines = [
+    { id: "pd", name: "Detailing Pipeline", stages: [{ id: "d-new", name: "New Lead" }, { id: "d-closed", name: "Closed" }] },
+    { id: "pc", name: "Ceramic Coating", stages: [{ id: "c-new", name: "New Lead" }, { id: "c-closed", name: "Closed" }] },
+    { id: "px", name: "Other", stages: [{ id: "x-new", name: "New" }] },
+  ];
+  const config = {
+    pipelines: [
+      { id: "pd", name: "Detailing Pipeline", closedStageId: "d-closed", closedStageName: "Closed", contradictTags: ["ceramic-coating"] },
+      { id: "pc", name: "Ceramic Coating", closedStageId: "c-closed", closedStageName: "Closed", contradictTags: ["detailing lead"] },
+    ],
+  };
+  const mkClient = async (key: string, opts: { token?: string; mode?: "off" | "preview" | "auto"; perms?: boolean } = {}) => {
+    const [c] = await db
+      .insert(clients)
+      .values({
+        name: `E2E wb ${key} ${tag}`, slug: `${tag}-wb-${key}`, ghlLocationId: `${tag}-wb-${key}`, ghlTokenEnc: encrypt(opts.token ?? "fake-pit"),
+        writebackConfig: config, writebackMode: opts.mode ?? "preview", writebackPermsOk: opts.perms ?? false,
+      })
+      .returning();
+    await db.insert(paymentConnections).values({
+      clientId: c.id, provider: "stripe", externalAccountId: `acct_${c.id.slice(0, 8)}`, accessTokenEnc: encrypt("sk_test_fake"),
+      livemode: false, scope: "manual-seed", lastSyncedAt: ago(2), syncedThrough: ago(2),
+    });
+    return c;
+  };
+  type Pay = { cents?: number; paidAt?: Date; status?: string; refunded?: number; match?: "matched" | "ambiguous" };
+  const lead = async (clientId: string, key: string, o: { opps?: Partial<MockOpp>[]; tags?: string[]; payments?: Pay[] } = {}) => {
+    const contactId = `${tag}-${key}`;
+    m.contacts.set(contactId, { id: contactId, email: `${contactId}@e2e.example.test`, tags: [...(o.tags ?? [])] });
+    (o.opps ?? [{}]).forEach((x, i) =>
+      m.opps.set(`${contactId}-o${i}`, {
+        id: `${contactId}-o${i}`, pipelineId: "pd", pipelineStageId: "d-new", status: "open", monetaryValue: 0,
+        createdAt: ago(10).toISOString(), contactId, ...x,
+      }),
+    );
+    const payments = o.payments ?? [{}];
+    for (const [j, p] of payments.entries()) {
+      const id = `ch_${contactId}_${j}`;
+      const paidAt = p.paidAt ?? ago(5);
+      m.charges.set(id, {
+        id, amount: p.cents ?? 15000, currency: "usd", status: p.status ?? "succeeded", refunded: false,
+        amount_refunded: p.refunded ?? 0, created: Math.floor(paidAt.getTime() / 1000),
+      });
+      await db.insert(paymentMatches).values({
+        clientId, provider: "stripe", externalPaymentId: id, paidAt, amountCents: p.cents ?? 15000, currency: "USD", paymentStatus: "COMPLETED",
+        payerEmail: `${contactId}@e2e.example.test`, status: p.match ?? "matched", method: "email",
+        contacts: [{ id: contactId, name: "Lead", email: `${contactId}@e2e.example.test`, phone: null }],
+      });
+    }
+    return contactId;
+  };
+  const opp = (contactId: string, i = 0) => m.opps.get(`${contactId}-o${i}`)!;
+  const okSync = [{ provider: "stripe" as const }];
+  const payRows = async (clientId: string) => db.select().from(paymentMatches).where(eq(paymentMatches.clientId, clientId));
+  const auditRows = async (clientId: string) => db.select().from(writebackAudit).where(eq(writebackAudit.clientId, clientId));
+  const page = async (jar: Jar, id: string, q = "") => (await (await jar.fetch(`/dashboard/clients/${id}${q}`)).text()).replace(/<!-- -->/g, "");
+  const prevEnv = { ...process.env };
+  process.env.STRIPE_API_URL = PROVIDER_MOCK_URL;
+  Object.assign(process.env, (await import("./e2e-mail")).MAIL_ENV); // summary emails from in-process runs go to the mail mock
+  const { GHL_RETRY } = await import("../src/lib/writeback/ghl");
+  GHL_RETRY.baseMs = 1;
+
+  try {
+    // ---------- Preview: plans, writes nothing ----------
+    const a = await mkClient("a");
+    await db.insert(clientMembers).values(clientUsers.map((u) => ({ clientId: a.id, userId: u.userId, role: u.role })));
+    const L = {
+      ok1: await lead(a.id, "ok1", { payments: [{ cents: 15000 }] }),
+      ok2: await lead(a.id, "ok2", { opps: [{ monetaryValue: 255 }], tags: ["payment-matched"], payments: [{ cents: 25500 }] }),
+      notag: await lead(a.id, "notag", {
+        opps: [{ pipelineId: "pc", pipelineStageId: "c-new" }], payments: [{ cents: 9900, paidAt: ago(20) }, { cents: 60000 }],
+      }),
+      closed: await lead(a.id, "closed", { opps: [{ pipelineId: "pc", pipelineStageId: "c-closed" }] }),
+      both: await lead(a.id, "both", { opps: [{}, { pipelineId: "pc", pipelineStageId: "c-new" }] }),
+      none: await lead(a.id, "none", { opps: [] }),
+      other: await lead(a.id, "other", { opps: [{ pipelineId: "px", pipelineStageId: "x-new" }] }),
+      tagged: await lead(a.id, "tagged", { tags: ["Ceramic-Coating"] }),
+      lost: await lead(a.id, "lost", { opps: [{ status: "lost" }] }),
+      before: await lead(a.id, "before", { opps: [{ createdAt: ago(2).toISOString() }] }),
+      value: await lead(a.id, "value", { opps: [{ monetaryValue: 100 }], payments: [{ cents: 20000 }] }),
+      refund: await lead(a.id, "refund", { payments: [{ cents: 15000, refunded: 100 }] }),
+      failed: await lead(a.id, "failed", { payments: [{ status: "failed" }] }),
+      pending: await lead(a.id, "pending", { payments: [{ status: "pending" }] }),
+      multi: await lead(a.id, "multi", { opps: [{}, {}] }),
+      ambiguous: await lead(a.id, "ambiguous", { payments: [{ match: "ambiguous" }] }),
+    };
+    const writes0 = m.writes.length;
+    check("write-back doesn't run after a sync where an account failed",
+      (await wb.writeBackAfterSync(a.id, [{ provider: "stripe", error: "boom" }], { trigger: "sync" })) === null &&
+        (await db.select().from(writebackRuns).where(eq(writebackRuns.clientId, a.id))).length === 0);
+    let out = await wb.writeBackAfterSync(a.id, okSync, { trigger: "sync" });
+    check("Preview after a sync plans 3 updates and writes nothing to GHL",
+      out?.status === "ok" && out.applied === false && out.planned === 3 && out.updated === 0 && m.writes.length === writes0, JSON.stringify(out));
+    const [run1] = await db.select().from(writebackRuns).where(eq(writebackRuns.clientId, a.id));
+    const item = (key: keyof typeof L) => run1.plan.find((i) => i.contactId === L[key]);
+    const expectSkip: [keyof typeof L, string | RegExp][] = [
+      ["closed", "already Closed"], ["both", "opportunities in more than one pipeline"], ["none", "no opportunity"],
+      ["other", "opportunity only in other pipelines"], ["tagged", /contradicts Detailing/], ["lost", "status lost"],
+      ["before", "all payments before the opportunity was created"], ["value", "existing value differs from amount paid"],
+      ["refund", "no qualifying payments"], ["failed", "no qualifying payments"], ["pending", "no qualifying payments"],
+      ["multi", "2 opportunities in Detailing Pipeline"],
+    ];
+    for (const [key, want] of expectSkip) {
+      const got = item(key)?.skip ?? "";
+      check(`skip rule: ${key}`, typeof want === "string" ? got === want : want.test(got), got);
+    }
+    check("refunded, failed and pending payments are left out with the reason",
+      item("refund")?.excluded[0]?.reason === "refunded" && item("failed")?.excluded[0]?.reason === "status failed" &&
+        item("pending")?.excluded[0]?.reason === "status pending");
+    check("ambiguous payments are never considered", !item("ambiguous"));
+    check("a lead with no tags is updated in its own pipeline (Ceramic) with the sum after the opportunity was created",
+      item("notag")?.skip === null && item("notag")?.target?.pipelineStageId === "c-closed" && item("notag")?.target?.monetaryValue === 600 &&
+        item("notag")?.excluded[0]?.reason === "paid before the opportunity was created");
+    check("a value already equal to the amount paid is left as is", item("ok2")?.skip === null && item("ok2")?.setValue === false);
+    const refundRow = (await payRows(a.id)).find((p) => p.externalPaymentId.startsWith(`ch_${L.refund}`));
+    check("refund re-check stores the refunded amount from the provider", refundRow?.refundedCents === 100 && Boolean(refundRow.refundCheckedAt));
+    await db.update(clients).set({ writebackMode: "off" }).where(eq(clients.id, a.id));
+    check("mode Off: no run", (await wb.runWriteBack(a.id, { trigger: "run_now" })) === null);
+    await db.update(clients).set({ writebackMode: "preview" }).where(eq(clients.id, a.id));
+
+    // ---------- Who sees it ----------
+    let html = await page(staff.jar, a.id);
+    check("staff see the write-back section with the plan and Apply",
+      html.includes("data-writeback") && html.includes(L.ok1) && html.includes("Skip: already Closed") && html.includes(">Apply<"));
+    for (const { role, jar } of clientUsers) {
+      const own = await page(jar, a.id);
+      // (GHL contact ids are in everyone's payments table already; the plan and its skip reasons are staff-only.)
+      check(`a client ${role} sees no write-back section or plan`,
+        own.includes(a.name) && !own.includes("data-writeback") && !own.includes("GHL write-back") && !own.includes("Skip: already Closed") &&
+          !own.includes(">Apply<") && !own.includes(">Run now<"));
+    }
+    const forms = {
+      mode: formFields(html, ">Save mode<"), perms: formFields(html, ">Check permissions<"),
+      runNow: formFields(html, ">Run now<"), apply: formFields(html, ">Apply<"),
+    };
+    forms.mode.set("mode", "auto");
+    const runsOf = async (id: string) => (await db.select().from(writebackRuns).where(eq(writebackRuns.clientId, id))).length;
+    for (const { role, jar } of clientUsers) {
+      const before = { runs: await runsOf(a.id), writes: m.writes.length };
+      const codes: number[] = [];
+      for (const f of Object.values(forms)) codes.push((await jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: f })).status);
+      const [after] = await db.select().from(clients).where(eq(clients.id, a.id));
+      check(`a client ${role} replaying Save mode / Check permissions / Run now / Apply gets 404 each, nothing changes`,
+        codes.every((c) => c === 404) && after.writebackMode === "preview" && !after.writebackPermsCheckedAt &&
+          (await runsOf(a.id)) === before.runs && m.writes.length === before.writes, codes.join(","));
+    }
+    let r = await staff.jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: forms.mode });
+    check("staff can't pick Auto before Check permissions passes",
+      (await db.select().from(clients).where(eq(clients.id, a.id)))[0].writebackMode === "preview" &&
+        new URL(r.headers.get("location") ?? "", BASE).searchParams.get("wb")?.includes("Check permissions first"), `${r.status}`);
+
+    // ---------- Apply (staff, over HTTP: the app calls the mock) ----------
+    const mail0 = mailbox.length;
+    r = await staff.jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: forms.apply });
+    const audit = await auditRows(a.id);
+    const byContact = (cid: string) => audit.find((x) => x.contactId === cid);
+    check("staff Apply updates the 3 planned opportunities",
+      r.status === 303 && audit.length === 3 && audit.every((x) => x.result === "ok"), `${r.status} ${audit.length}`);
+    check("each opportunity moved to its own pipeline's Closed stage, Won, value set only where it was empty",
+      opp(L.ok1).pipelineStageId === "d-closed" && opp(L.ok1).status === "won" && opp(L.ok1).monetaryValue === 150 &&
+        opp(L.ok2).monetaryValue === 255 && opp(L.notag).pipelineId === "pc" && opp(L.notag).pipelineStageId === "c-closed" &&
+        opp(L.notag).monetaryValue === 600);
+    check("the value isn't sent when it already matched", !m.writes.some((w) => w.path.endsWith(`${L.ok2}-o0`) && "monetaryValue" in w.body));
+    check("audit rows keep the previous pipeline, stage, status and value",
+      byContact(L.ok1)?.previousStageId === "d-new" && byContact(L.ok1)?.previousStatus === "open" && byContact(L.ok1)?.previousValue === 0 &&
+        byContact(L.notag)?.previousPipelineName === "Ceramic Coating" && byContact(L.notag)?.newValue === 600);
+    check("the payment-matched tag is added, or noted as already there",
+      m.contacts.get(L.ok1)!.tags.includes("payment-matched") && byContact(L.ok1)?.tagStatus === "added" && byContact(L.ok2)?.tagStatus === "already");
+    const pushed = (await payRows(a.id)).filter((p) => p.writebackState === "pushed");
+    check("pushed payments are marked with their audit row (the early Ceramic payment isn't)",
+      pushed.length === 3 && pushed.every((p) => audit.some((x) => x.id === p.writebackAuditId)));
+    const mail = mailbox.slice(mail0);
+    check("Apply sends one summary email to agency staff only, counts only",
+      mail.length === 1 && mail[0].body.subject === "GHL write-back: 3 updated" && mail[0].body.to.includes(staff.email) &&
+        !clientUsers.some((u) => mail[0].body.to.some((t) => t.includes(`-${u.role}@`))) &&
+        !/\$|Lead|E2E wb/.test(mail[0].body.text) && !mail[0].body.text.includes(L.ok1),
+      mail.map((x) => x.body.subject).join("|"));
+
+    // ---------- Idempotency ----------
+    const writes1 = m.writes.length;
+    out = await wb.runWriteBack(a.id, { trigger: "apply" });
+    check("a second run pushes nothing again", out?.updated === 0 && out.planned === 0 && m.writes.length === writes1, JSON.stringify(out));
+    const dup = await db.insert(writebackAudit).values({ ...byContact(L.ok1)!, id: undefined, createdAt: new Date() }).onConflictDoNothing().returning();
+    check("the database refuses a second live push of the same opportunity", dup.length === 0);
+    const [held] = await db.insert(writebackRuns).values({ clientId: a.id, trigger: "run_now", applied: false }).returning();
+    out = await wb.runWriteBack(a.id, { trigger: "run_now" });
+    check("only one run per client at a time", out?.status === "locked");
+    await db.update(writebackRuns).set({ startedAt: new Date(Date.now() - 11 * 60_000) }).where(eq(writebackRuns.id, held.id));
+    out = await wb.runWriteBack(a.id, { trigger: "run_now" });
+    const [heldAfter] = await db.select().from(writebackRuns).where(eq(writebackRuns.id, held.id));
+    check("a run stuck for over 10 minutes is cleared as interrupted", out?.status === "ok" && heldAfter.status === "error");
+
+    // ---------- Refund after the push ----------
+    const ok1Charge = [...m.charges.values()].find((c) => c.id.startsWith(`ch_${L.ok1}`))!;
+    ok1Charge.amount_refunded = 15000;
+    ok1Charge.refunded = true;
+    await db.update(paymentMatches).set({ refundCheckedAt: null }).where(eq(paymentMatches.externalPaymentId, ok1Charge.id));
+    const writes2 = m.writes.length;
+    out = await wb.runWriteBack(a.id, { trigger: "apply" });
+    const ok1Audit = (await auditRows(a.id)).find((x) => x.contactId === L.ok1)!;
+    check("a pushed payment refunded later flags its audit row 'needs review' and changes nothing in GHL",
+      out?.newNeedsReview === 1 && ok1Audit.needsReview && m.writes.length === writes2 && opp(L.ok1).status === "won", JSON.stringify(out));
+    out = await wb.runWriteBack(a.id, { trigger: "apply" });
+    check("it's flagged once", out?.newNeedsReview === 0);
+    html = await page(staff.jar, a.id);
+    check("the client page shows the needs-review flag", html.includes("1 need review") && html.includes("needs review:"));
+
+    // ---------- Undo / Release ----------
+    const undoForm = formFields(html, ">Undo<");
+    const notagAudit = (await auditRows(a.id)).find((x) => x.contactId === L.notag)!;
+    undoForm.set("auditId", notagAudit.id);
+    for (const { role, jar } of clientUsers) {
+      r = await jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: undoForm });
+      check(`a client ${role} replaying Undo gets 404, nothing restored`,
+        r.status === 404 && (await auditRows(a.id)).find((x) => x.id === notagAudit.id)?.result === "ok" && opp(L.notag).status === "won");
+    }
+    r = await staff.jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: undoForm });
+    const notagAfter = (await auditRows(a.id)).find((x) => x.id === notagAudit.id)!;
+    check("staff Undo restores the previous pipeline, stage, status and value, and removes the tag it added",
+      notagAfter.result === "undone" && opp(L.notag).pipelineId === "pc" && opp(L.notag).pipelineStageId === "c-new" &&
+        opp(L.notag).status === "open" && opp(L.notag).monetaryValue === 0 && !m.contacts.get(L.notag)!.tags.includes("payment-matched"),
+      JSON.stringify(opp(L.notag)));
+    const blocked = (await payRows(a.id)).filter((p) => p.writebackAuditId === notagAudit.id);
+    check("undone payments stay blocked", blocked.length === 1 && blocked[0].writebackState === "blocked");
+    out = await wb.runWriteBack(a.id, { trigger: "apply" });
+    const lastRun = (await db.select().from(writebackRuns).where(eq(writebackRuns.id, out!.runId!)))[0];
+    check("a blocked lead isn't pushed again", out?.updated === 0 &&
+      /blocked after undo/.test(lastRun.plan.find((i) => i.contactId === L.notag)?.excluded.map((e) => e.reason).join() ?? ""));
+    html = await page(staff.jar, a.id);
+    const releaseForm = formFields(html, ">Release<");
+    for (const { role, jar } of clientUsers) {
+      r = await jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: releaseForm });
+      check(`a client ${role} replaying Release gets 404, payments stay blocked`,
+        r.status === 404 && (await payRows(a.id)).some((p) => p.writebackState === "blocked"));
+    }
+    await staff.jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: releaseForm });
+    check("staff Release frees the payments", !(await payRows(a.id)).some((p) => p.writebackState === "blocked"));
+    out = await wb.runWriteBack(a.id, { trigger: "apply" });
+    check("after Release the lead can be pushed again", out?.updated === 1 && opp(L.notag).status === "won", JSON.stringify(out));
+
+    opp(L.ok2).status = "lost";
+    const ok2Audit = (await auditRows(a.id)).find((x) => x.contactId === L.ok2)!;
+    const undoErr = await wb.undoAudit(ok2Audit.id, staff.userId).then(() => "", (e: Error) => e.message);
+    check("Undo refuses an opportunity that changed in GHL after the push", /changed in GHL/.test(undoErr) && opp(L.ok2).status === "lost");
+    opp(L.ok2).status = "won";
+
+    html = await page(staff.jar, a.id);
+    const undoRunForm = formFields(html, ">Undo run<");
+    for (const { role, jar } of clientUsers) {
+      r = await jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: undoRunForm });
+      check(`a client ${role} replaying Undo run gets 404`, r.status === 404 && opp(L.ok1).status === "won");
+    }
+    const runId = undoRunForm.get("runId") as string;
+    const liveInRun = (await auditRows(a.id)).filter((x) => x.runId === runId && x.result === "ok").length;
+    await staff.jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: undoRunForm });
+    const rowsAfterRunUndo = (await auditRows(a.id)).filter((x) => x.runId === runId);
+    check("staff Undo run restores every live update of that run",
+      liveInRun > 0 && rowsAfterRunUndo.every((x) => x.result !== "ok"), `${liveInRun} live`);
+
+    // ---------- Kill switch ----------
+    const dash = (await (await staff.jar.fetch("/dashboard")).text()).replace(/<!-- -->/g, "");
+    check("staff see the kill switch on the dashboard", dash.includes("data-writeback-switch") && dash.includes(">Switch write-back off<"));
+    const switchForm = formFields(dash, ">Switch write-back off<");
+    for (const { role, jar } of clientUsers) {
+      const own = (await (await jar.fetch("/dashboard")).text());
+      r = await jar.fetch("/dashboard", { method: "POST", body: switchForm });
+      check(`a client ${role} sees no kill switch and replaying it gets 404`,
+        !own.includes("data-writeback-switch") && r.status === 404 && (await wb.writebackSwitch()).enabled);
+    }
+    await staff.jar.fetch("/dashboard", { method: "POST", body: switchForm });
+    const k = await mkClient("kill");
+    const kLead = await lead(k.id, "kill1");
+    const writes3 = m.writes.length;
+    out = await wb.runWriteBack(k.id, { trigger: "apply" });
+    check("kill switch (database flag) off: the run plans but writes nothing",
+      !(await wb.writebackSwitch()).enabled && out?.status === "killed" && out.planned === 1 && m.writes.length === writes3 && opp(kLead).status === "open");
+    await wb.setWritebackEnabled(true, staff.userId);
+    process.env.WRITEBACK_DISABLED = "1";
+    out = await wb.runWriteBack(k.id, { trigger: "apply" });
+    check("WRITEBACK_DISABLED=1 overrides the database flag", out?.status === "killed" && m.writes.length === writes3);
+    delete process.env.WRITEBACK_DISABLED;
+
+    // ---------- Caps ----------
+    const c = await mkClient("cap");
+    for (const i of [1, 2, 3]) await lead(c.id, `cap${i}`);
+    out = await wb.runWriteBack(c.id, { trigger: "apply", cap: 2 });
+    check("stops at the cap and flags it; the rest wait", out?.status === "capped" && out.updated === 2 && /cap of 2/.test(out.error ?? ""), JSON.stringify(out));
+    out = await wb.runWriteBack(c.id, { trigger: "apply", cap: 2 });
+    check("the next run does the rest", out?.status === "ok" && out.updated === 1);
+    check("the default per-client cap is 20 and the cron cap 100", wb.RUN_CAP === 20 && wb.CRON_CAP === 100);
+    const b = await mkClient("budget");
+    await lead(b.id, "budget1");
+    await lead(b.id, "budget2");
+    const budget = { remaining: 1 };
+    out = await wb.runWriteBack(b.id, { trigger: "apply", budget });
+    check("the cron run's shared budget stops a client too", out?.status === "capped" && out.updated === 1 && budget.remaining === 0);
+
+    // ---------- First error stops the client ----------
+    const e = await mkClient("err");
+    const e1 = await lead(e.id, "err1");
+    const e2 = await lead(e.id, "err2");
+    m.failPut.add(`${e1}-o0`);
+    out = await wb.runWriteBack(e.id, { trigger: "apply" });
+    const eRun = (await db.select().from(writebackRuns).where(eq(writebackRuns.id, out!.runId!)))[0];
+    const eAudit = await auditRows(e.id);
+    check("stops at the first error: nothing after it is written",
+      out?.status === "error" && out.updated === 0 && opp(e2).status === "open" &&
+        eRun.plan.find((i) => i.contactId === e2)?.outcome === "not_reached", JSON.stringify(out));
+    check("the failed update is recorded and its payments stay pushable",
+      eAudit.length === 1 && eAudit[0].result === "error" && !(await payRows(e.id)).some((p) => p.writebackState));
+    m.failPut.clear();
+    html = await page(staff.jar, e.id);
+    check("the error shows on the client page", html.includes("mock failure"));
+
+    // ---------- Permissions, Auto, daily cron ----------
+    const f = await mkClient("auto");
+    const fLead = await lead(f.id, "auto1");
+    check("Auto refused before Check permissions", /Check permissions first/.test((await setMode(f.id, "auto")) ?? ""));
+    let perms = await checkPermissions(f.id);
+    check("Check permissions passes with probes that change nothing",
+      perms.ok && perms.lines.length === 5 && !m.writes.some((w) => w.path.includes("pmlPermissionProbe")), perms.lines.join(" | "));
+    check("Auto allowed once it passed", (await setMode(f.id, "auto")) === null);
+    const g = await mkClient("deny", { token: "deny-write" });
+    perms = await checkPermissions(g.id);
+    check("a token without write permission fails the check, and Auto stays refused",
+      !perms.ok && perms.lines.some((l) => /Update opportunities: refused \(401\)/.test(l)) && /Check permissions first/.test((await setMode(g.id, "auto")) ?? ""),
+      perms.lines.join(" | "));
+    const h = await mkClient("previewcron"); // synced 2 days ago, Preview: not due (14 days)
+    const mail1 = mailbox.length;
+    const report = await runAutoSync({ onlyClientIds: [f.id, h.id] });
+    check("Auto clients are synced daily; others keep 14 days",
+      report.synced.map((s) => s.client).join() === f.name, JSON.stringify(report.synced));
+    check("the cron runs write-back after the sync and writes in Auto",
+      report.writeBack[0]?.updated === 1 && opp(fLead).status === "won" && report.writeBackEmail === "sent", JSON.stringify(report.writeBack));
+    const cronMail = mailbox.slice(mail1);
+    check("one summary email per cron run, staff only", cronMail.length === 1 && cronMail[0].body.subject === "GHL write-back: 1 updated");
+    check("payments are still matched after the cron's sync re-match", (await payRows(f.id)).every((p) => p.status === "matched"));
+
+    // The guard behind all of this: without the mock URL, an e2e process refuses to call GHL at all.
+    const { ghlBaseUrl } = await import("../src/lib/ghl-url");
+    delete process.env.GHL_API_URL;
+    const guard = (() => {
+      try {
+        ghlBaseUrl();
+        return "no error";
+      } catch (err) {
+        return (err as Error).message;
+      }
+    })();
+    process.env.GHL_API_URL = PROVIDER_MOCK_URL;
+    check("e2e guard: no GHL_API_URL means no GHL call, never a fall back to real GHL", /refusing to call real GHL/.test(guard), guard);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in prevEnv)) delete process.env[key];
+    Object.assign(process.env, prevEnv);
+    await wb.setWritebackEnabled(true, null).catch(() => {});
+  }
+}
+
 // Mock of Resend's POST /emails. Records every request; a recipient containing
 // "fail-email" gets a 422 whose message repeats the address (it must not be logged).
 type MailRequest = { path: string; auth: string; body: { from: string; to: string[]; subject: string; text: string; html?: string; reply_to?: unknown } };
@@ -1074,6 +1541,7 @@ async function inviteEmailChecks(
 async function main() {
   await warmUpE2EDatabase();
   await startMailMock();
+  await startProviderMock();
   const { eq, like, inArray } = await import("drizzle-orm");
   const { db } = await import("../src/db");
   const { agencyStaff, clients, clientMembers, invitations, paymentConnections, paymentMatches, user } = await import("../src/db/schema");
@@ -1389,6 +1857,13 @@ async function main() {
       staff: { jar: staff, userId: staffRow.id },
     }, formFields);
 
+    // --- GHL write-back: mocked GHL only; rules, Preview/Apply/Auto, caps, undo, kill switch, roles ---
+    await writebackChecks(tag, [
+      { role: "owner", jar: owner, userId: ownerRow.id },
+      { role: "admin", jar: admin, userId: adminRow.id },
+      { role: "viewer", jar: viewer, userId: viewerRow.id },
+    ], { jar: staff, userId: staffRow.id, email: staffEmail }, formFields);
+
     // --- Remove client: agency staff only, behind a dialog; cascades to everything stored for it ---
     const [doomed] = await db.insert(clients).values({ name: `E2E remove ${tag}`, slug: `${tag}-remove` }).returning();
     await db.insert(clientMembers).values({ clientId: doomed.id, userId: ownerRow.id, role: "owner" });
@@ -1442,6 +1917,7 @@ async function main() {
     );
     await cleanup("auto sync clients", () => db.delete(clients).where(like(clients.slug, `${tag}-auto-%`)));
     await cleanup("health clients", () => db.delete(clients).where(like(clients.slug, `${tag}-health-%`)));
+    await cleanup("write-back clients", () => db.delete(clients).where(like(clients.slug, `${tag}-wb-%`)));
   }
 
   // Encryption round trip

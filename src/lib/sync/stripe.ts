@@ -29,6 +29,12 @@ export type StripeCharge = {
 const PAGE_LIMIT = 100; // list endpoints' max
 const API = "https://api.stripe.com";
 
+// STRIPE_API_URL exists only so the e2e server can point at the suite's mock; localhost only.
+function apiBase() {
+  const override = process.env.STRIPE_API_URL?.trim();
+  return override && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/?$/.test(override) ? override : API;
+}
+
 // Square-style statuses, so the table treats both providers the same
 // ("COMPLETED" shows no status line).
 export function stripeChargeStatus(c: Pick<StripeCharge, "status" | "refunded" | "amount_refunded">) {
@@ -44,7 +50,7 @@ export class StripeApi {
   ) {}
 
   private async get<T>(path: string, params: [string, string][]) {
-    const url = new URL(path, API);
+    const url = new URL(path, apiBase());
     for (const [k, v] of params) url.searchParams.append(k, v);
     const res = await fetch(url, {
       headers: {
@@ -79,5 +85,10 @@ export class StripeApi {
       startingAfter = body.data.at(-1)!.id;
     }
     return all;
+  }
+
+  // One charge, for write-back's refund re-check.
+  async charge(id: string) {
+    return this.get<StripeCharge>(`/v1/charges/${encodeURIComponent(id)}`, []);
   }
 }

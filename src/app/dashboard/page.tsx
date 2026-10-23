@@ -5,7 +5,8 @@ import { SubmitButton } from "@/components/submit-button";
 import { db } from "@/db";
 import { agencyStaff, clientMembers, clients, invitations, user } from "@/db/schema";
 import { isAgencyStaff, requireSession } from "@/lib/access";
-import { removeStaffAction, revokeStaffInviteAction } from "./actions";
+import { writebackSwitch } from "@/lib/writeback/run";
+import { removeStaffAction, revokeStaffInviteAction, setWritebackSwitchAction } from "./actions";
 import { NewClientForm, StaffInviteForm } from "./agency-forms";
 import { SignOutButton } from "./sign-out-button";
 
@@ -30,6 +31,8 @@ export default async function DashboardPage(props: PageProps<"/dashboard">) {
         .innerJoin(clients, eq(clientMembers.clientId, clients.id))
         .where(eq(clientMembers.userId, session.user.id))
         .orderBy(asc(clients.name));
+
+  const killSwitch = agency ? await writebackSwitch() : null;
 
   const [staff, staffInvites] = agency
     ? await Promise.all([
@@ -107,6 +110,35 @@ export default async function DashboardPage(props: PageProps<"/dashboard">) {
           </div>
         )}
       </section>
+
+      {killSwitch && (
+        <section className={card} data-writeback-switch>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="font-medium">GHL write-back</h2>
+              <p className="text-sm text-zinc-500">
+                {killSwitch.enabled
+                  ? "On: clients in Auto (and Apply in Preview) may update GHL opportunities."
+                  : killSwitch.envDisabled
+                    ? "Off for every client: WRITEBACK_DISABLED is set on the server."
+                    : "Off for every client (kill switch). Runs still plan; nothing is written. Undo still works."}
+              </p>
+            </div>
+            <form action={setWritebackSwitchAction}>
+              <input type="hidden" name="enabled" value={killSwitch.dbEnabled ? "false" : "true"} />
+              <SubmitButton
+                className={
+                  killSwitch.dbEnabled
+                    ? "rounded-md border border-red-300 px-3 py-1.5 text-sm text-red-700 dark:border-red-900 dark:text-red-400"
+                    : "rounded-md border px-3 py-1.5 text-sm"
+                }
+              >
+                {killSwitch.dbEnabled ? "Switch write-back off" : "Switch write-back on"}
+              </SubmitButton>
+            </form>
+          </div>
+        </section>
+      )}
 
       {agency && (
         <section className={card}>

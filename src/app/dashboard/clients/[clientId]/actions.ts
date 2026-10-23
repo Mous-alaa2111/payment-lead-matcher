@@ -22,6 +22,8 @@ import { sendInviteEmail, type InviteEmailStatus } from "@/lib/invite-email";
 import { canManageInviteRole, createInvitation, revokeInvitation } from "@/lib/invitations";
 import { syncClient } from "@/lib/sync";
 import { formatDay, parseRange, type SyncWindow } from "@/lib/sync/window";
+import { sendWritebackSummary } from "@/lib/writeback/email";
+import { writeBackAfterSync } from "@/lib/writeback/run";
 
 const ROLES: ClientRole[] = ["owner", "admin", "viewer"];
 
@@ -117,7 +119,7 @@ export async function syncRangeAction(clientId: string, form: FormData) {
 // the date-range form posts from/to (YYYY-MM-DD) for a backfill or one period.
 export async function syncAction(form: FormData) {
   const clientId = String(form.get("clientId"));
-  await requireManager(clientId);
+  const { session } = await requireManager(clientId);
   const page = `/dashboard/clients/${clientId}`;
 
   const from = String(form.get("from") ?? "");
@@ -132,6 +134,10 @@ export async function syncAction(form: FormData) {
   // Every connected account is synced; each one's error is stored on its
   // connection and shown on the page.
   const results = await syncClient(clientId, range);
+  // GHL write-back for Preview/Auto clients. Staff set the mode; a sync by an
+  // owner or admin runs it too, but they never see or control it.
+  const wb = await writeBackAfterSync(clientId, results, { trigger: "sync", userId: session.user.id });
+  if (wb) await sendWritebackSummary([wb], range ? "Sync range" : "Sync now");
   const done = results.flatMap((r) => (r.summary ? [r.summary] : []));
   let result: string;
   if (!done.length) {
