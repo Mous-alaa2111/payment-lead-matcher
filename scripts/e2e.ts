@@ -1080,7 +1080,7 @@ async function writebackChecks(
     let r = await staff.jar.fetch(`/dashboard/clients/${a.id}`, { method: "POST", body: forms.mode });
     check("staff can't pick Auto before Check permissions passes",
       (await db.select().from(clients).where(eq(clients.id, a.id)))[0].writebackMode === "preview" &&
-        new URL(r.headers.get("location") ?? "", BASE).searchParams.get("wb")?.includes("Check permissions first"), `${r.status}`);
+        new URL(r.headers.get("location") ?? "", BASE).searchParams.get("wb")?.includes("Check permissions first") === true, `${r.status}`);
 
     // ---------- Apply (staff, over HTTP: the app calls the mock) ----------
     const mail0 = mailbox.length;
